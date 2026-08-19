@@ -1,0 +1,58 @@
+# LLM provider for every agent and every ImagePatch tool call.
+#
+# Default is Google Gemini's free tier, reached through its OpenAI-compatible
+# endpoint — so the existing AsyncOpenAI client works with only a base_url and
+# model change. Gemini is used because the Observer agent needs *vision*, and
+# Gemini's free tier includes image input at no cost and with no credit card.
+#
+# Get a key at https://aistudio.google.com/apikey, then either:
+#     export LLM_API_KEY=...
+# or write it to GraspMAS/api.key
+#
+# Any OpenAI-compatible provider works: change base_url + model.
+
+provider: gemini
+base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+api_key_env: LLM_API_KEY
+api_key_file: api.key
+
+# Resolved against the live /models list at startup: the first id here that the
+# key can actually reach wins. Free-tier model availability changes often, so a
+# hard pin ages badly; run `python -m agents.llm --probe` to see the live list.
+model_candidates:
+  - gemini-3.5-flash
+  - gemini-3.6-flash
+  - gemini-3-flash
+  - gemini-2.5-flash
+  - gemini-flash-latest
+vision_model_candidates:
+  - gemini-3.5-flash
+  - gemini-3.6-flash
+  - gemini-3-flash
+  - gemini-2.5-flash
+  - gemini-flash-latest
+
+# Free tier is ~10-15 RPM. GraspMAS issues 3+ calls per round, and main_batch
+# runs asyncio.gather over a batch, so without pacing the very first batch 429s.
+rate_limit_rpm: 10
+max_retries: 5
+timeout_s: 120
+retry_base_delay_s: 2.0
+
+# Gemini's OpenAI-compat layer ignores or rejects some OpenAI parameters.
+# Anything listed here is stripped before the request is sent.
+unsupported_params:
+  - frequency_penalty
+  - presence_penalty
+
+# Optional overflow when the primary is rate-limited or out of daily quota.
+# Needs its own key in OPENROUTER_API_KEY; skipped silently when absent.
+fallback:
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  model: google/gemma-4-31b-it:free
+  vision_model: google/gemma-4-31b-it:free
+  unsupported_params:
+    - frequency_penalty
+    - presence_penalty

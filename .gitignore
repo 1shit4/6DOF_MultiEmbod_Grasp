@@ -1,0 +1,11 @@
+cat << 'EOF' > .gitignore
+assets/
+outputs/
+env/
+__pycache__/
+*.npy
+*.npz
+*.pth
+*.pt
+api.key
+EOF

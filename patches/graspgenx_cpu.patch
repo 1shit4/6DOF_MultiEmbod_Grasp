@@ -1,0 +1,285 @@
+diff --git a/client-server/graspgenx_server.py b/client-server/graspgenx_server.py
+index 3b357a6..1da6258 100644
+--- a/client-server/graspgenx_server.py
++++ b/client-server/graspgenx_server.py
+@@ -25,6 +25,7 @@ Usage:
+ 
+ import argparse
+ import logging
++import os
+ 
+ 
+ def parse_args():
+@@ -76,6 +77,22 @@ def parse_args():
+         choices=["fp32", "fp16"],
+         help="TensorRT precision when --tensorrt is set (default: fp32).",
+     )
++    parser.add_argument(
++        "--device",
++        type=str,
++        default=None,
++        choices=["cpu", "cuda"],
++        help="Device for the model. Defaults to $GRASPGENX_DEVICE, else cuda "
++        "if available, else cpu. On cpu the ptv3vanilla backbone is forced "
++        "onto its fp32 attention path (the checkpoints ship enable_flash=true, "
++        "which casts q/k/v to fp16 — a CUDA-oriented path).",
++    )
++    parser.add_argument(
++        "--threads",
++        type=int,
++        default=None,
++        help="torch intra-op threads (CPU only). Defaults to os.cpu_count().",
++    )
+     return parser.parse_args()
+ 
+ 
+@@ -87,6 +104,21 @@ def main():
+ 
+     args = parse_args()
+ 
++    # Must be set before graspgenx.grasp_server resolves the device.
++    if args.device:
++        os.environ["GRASPGENX_DEVICE"] = args.device
++
++    import torch
++
++    from graspgenx.grasp_server import resolve_device
++
++    device = resolve_device()
++    if device.type == "cpu":
++        torch.set_num_threads(args.threads or os.cpu_count() or 1)
++    logging.getLogger(__name__).info(
++        "GraspGenX server device=%s threads=%d", device, torch.get_num_threads()
++    )
++
+     from graspgenx.serving.zmq_server import GraspGenXZMQServer
+ 
+     server = GraspGenXZMQServer(
+diff --git a/graspgenx/grasp_server.py b/graspgenx/grasp_server.py
+index b86237f..0925820 100644
+--- a/graspgenx/grasp_server.py
++++ b/graspgenx/grasp_server.py
+@@ -21,6 +21,24 @@ from graspgenx.utils.logging_config import get_logger
+ 
+ logger = get_logger(__name__)
+ 
++
++def resolve_device() -> torch.device:
++    """Device for model weights and request tensors.
++
++    ``GRASPGENX_DEVICE`` overrides autodetection so the model can be pinned to
++    CPU on a machine with no GPU (or forced to CPU for parity debugging).
++    """
++    override = os.environ.get("GRASPGENX_DEVICE")
++    if override:
++        return torch.device(override)
++    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++
++def sampler_device(sampler) -> torch.device:
++    """Device a sampler's weights actually live on."""
++    return next(sampler.model.parameters()).device
++
++
+ # gripper_backbone values that can be conditioned from raw sweep-volume
+ # parameters alone (no gripper point clouds / TSDF / VAE assets required).
+ SWEEP_VOLUME_ONLY_BACKBONES = {
+@@ -32,12 +50,31 @@ SWEEP_VOLUME_ONLY_BACKBONES = {
+ }
+ 
+ 
++def disable_flash_attention(cfg: omegaconf.DictConfig) -> None:
++    """Force the ptv3vanilla backbone onto its fp32 attention path.
++
++    The released checkpoints ship ``enable_flash: true``, which casts q/k/v to
++    fp16 before ``scaled_dot_product_attention``. That is a CUDA-oriented path;
++    on CPU it is unsupported or drastically slower. The ``else`` branch is the
++    mathematically equivalent fp32 matmul+softmax (with ``upcast_attention`` and
++    ``upcast_softmax`` on), and the weights are dtype-agnostic — so this is a
++    pure config change with no effect on the state dict.
++    """
++    for side in ("diffusion", "discriminator"):
++        block = cfg.get(side)
++        if block is not None and block.get("ptv3vanilla") is not None:
++            block.ptv3vanilla.enable_flash = False
++
++
+ def load_grasp_gen_model(cfg: omegaconf.DictConfig):
+     """Load the (gripper-independent) GraspGen model from cfg checkpoints.
+ 
+     The returned model can back any number of samplers — the gripper
+     conditioning travels with each request's data batch, not the weights.
+     """
++    device = resolve_device()
++    if device.type != "cuda":
++        disable_flash_attention(cfg)
+     model = GraspGen.from_config(cfg.diffusion, cfg.discriminator)
+     if not os.path.exists(cfg.eval.gen_checkpoint):
+         raise FileNotFoundError(f"Checkpoint {cfg.eval.gen_checkpoint} does not exist")
+@@ -45,7 +82,7 @@ def load_grasp_gen_model(cfg: omegaconf.DictConfig):
+         raise FileNotFoundError(f"Checkpoint {cfg.eval.dis_checkpoint} does not exist")
+     model.load_state_dict(cfg.eval.gen_checkpoint, cfg.eval.dis_checkpoint)
+     model.eval()
+-    return model.cuda().eval()
++    return model.to(device).eval()
+ 
+ 
+ class GraspGenXSampler:
+@@ -194,7 +231,9 @@ class GraspGenXSampler:
+             grasp_conf: Confidence scores for the grasps
+         """
+         if type(object_pc) == np.ndarray:
+-            object_pc = torch.from_numpy(object_pc).cuda().float()
++            object_pc = (
++                torch.from_numpy(object_pc).to(sampler_device(grasp_sampler)).float()
++            )
+ 
+         if grasp_threshold == -1.0 and topk_num_grasps == -1:
+             topk_num_grasps = 100
+@@ -448,20 +487,21 @@ class GraspGenXSampler:
+ 
+     @torch.inference_mode()
+     def load_gripper_input(self, outputs):
++        device = sampler_device(self)
+ 
+         outputs["z_offset"] = torch.tensor(
+             (self.gripper.depth,), dtype=torch.float32
+-        ).cuda()
++        ).to(device)
+         outputs["sweep_volume"] = torch.from_numpy(
+             self.gripper.sweep_volume.astype(np.float32)
+-        ).cuda()
++        ).to(device)
+         outputs["gripper_type"] = self.gripper.gripper_type
+ 
+         sweep_volume_open = self.gripper.sweep_volume.astype(np.float32)
+         sweep_volume_mid = self.gripper.sweep_volume_mid.astype(np.float32)
+         outputs["sweep_volume_open_and_mid"] = torch.from_numpy(
+             np.concatenate([sweep_volume_open, sweep_volume_mid], axis=0)
+-        ).cuda()
++        ).to(device)
+ 
+         gripper_open_ptc = self.gripper.open_pointcloud.copy()
+         gripper_close_ptc = self.gripper.close_pointcloud.copy()
+@@ -471,14 +511,14 @@ class GraspGenXSampler:
+         )
+         gripper_open_ptc = torch.from_numpy(
+             gripper_close_ptc[mask].astype(np.float32)
+-        ).cuda()
++        ).to(device)
+ 
+         mask = np.random.randint(
+             0, gripper_close_ptc.shape[0], (self.cfg.data.num_points,)
+         )
+         gripper_close_ptc = torch.from_numpy(
+             gripper_close_ptc[mask].astype(np.float32)
+-        ).cuda()
++        ).to(device)
+ 
+         outputs["gripper_open_ptc"] = gripper_open_ptc
+         outputs["gripper_close_ptc"] = gripper_close_ptc
+@@ -489,7 +529,7 @@ class GraspGenXSampler:
+         )
+         outputs["gripper_vol_tsdf"] = torch.from_numpy(
+             vol_tsdf.astype(np.float32)
+-        ).cuda()
++        ).to(device)
+ 
+         outputs["gripper_pointnet_repr"] = torch.from_numpy(
+             np.concatenate(
+@@ -500,7 +540,7 @@ class GraspGenXSampler:
+                 ],
+                 axis=0,
+             ).astype(np.float32)
+-        ).cuda()
++        ).to(device)
+ 
+         return outputs
+ 
+diff --git a/graspgenx/serving/zmq_server.py b/graspgenx/serving/zmq_server.py
+index 50a2069..bf0d7b2 100644
+--- a/graspgenx/serving/zmq_server.py
++++ b/graspgenx/serving/zmq_server.py
+@@ -97,6 +97,13 @@ PLANNER_KNOB_DEFAULTS = {
+ }
+ 
+ 
++def _to_numpy(x):
++    """Accept a torch tensor or an array-like and return a numpy array."""
++    if hasattr(x, "detach"):
++        return x.detach().cpu().numpy()
++    return np.asarray(x)
++
++
+ class GraspGenXZMQServer:
+     """ZMQ REQ/REP wrapper around :class:`GraspGenXSampler`.
+ 
+@@ -476,26 +483,50 @@ class GraspGenXZMQServer:
+         num_grasps = int(request.get("num_grasps", 200))
+         grasp_threshold = float(request.get("grasp_threshold", -1.0))
+         topk_num_grasps = int(request.get("topk_num_grasps", 100))
++        # Optional: route through the GraspMoE planner (diffusion ∪ OBB, both
++        # scored by the discriminator) while still resolving the gripper by
++        # name. Upstream only exposes graspmoe on the params-only
++        # `infer_object` action, which cannot take a gripper_name.
++        planner = str(request.get("planner", "diffusion"))
++        if planner not in ("diffusion", "graspmoe"):
++            raise ValueError(
++                f"Unknown planner {planner!r}; expected 'diffusion' or 'graspmoe'."
++            )
+ 
+         sampler = self._get_sampler(gripper_name)
+ 
+         t0 = time.monotonic()
+-        grasps, confidences = GraspGenXSampler.run_inference(
+-            pc,
+-            sampler,
+-            grasp_threshold=grasp_threshold,
+-            num_grasps=num_grasps,
+-            topk_num_grasps=topk_num_grasps,
+-        )
++        branch_tags: list[str] = []
++        if planner == "graspmoe":
++            from graspgenx.samplers.planner import run_planner_on_object
++
++            grasps, confidences, branch_tags, _obb = run_planner_on_object(
++                pc,
++                sampler,
++                planner="graspmoe",
++                grasp_threshold=grasp_threshold,
++                num_grasps=num_grasps,
++                topk_num_grasps=topk_num_grasps,
++            )
++        else:
++            grasps, confidences = GraspGenXSampler.run_inference(
++                pc,
++                sampler,
++                grasp_threshold=grasp_threshold,
++                num_grasps=num_grasps,
++                topk_num_grasps=topk_num_grasps,
++            )
+         infer_ms = (time.monotonic() - t0) * 1000.0
+ 
++        # run_inference returns torch tensors; run_planner_on_object already
++        # returns numpy. Normalize so either planner serializes the same way.
+         grasps_np = (
+-            grasps.detach().cpu().numpy().astype(np.float32)
++            _to_numpy(grasps).reshape(-1, 4, 4).astype(np.float32)
+             if len(grasps)
+             else np.zeros((0, 4, 4), dtype=np.float32)
+         )
+         conf_np = (
+-            confidences.detach().cpu().numpy().astype(np.float32)
++            _to_numpy(confidences).reshape(-1).astype(np.float32)
+             if len(confidences)
+             else np.zeros((0,), dtype=np.float32)
+         )
+@@ -504,6 +535,8 @@ class GraspGenXZMQServer:
+             "grasps": grasps_np,
+             "confidences": conf_np,
+             "gripper_name": gripper_name,
++            "planner": planner,
++            "branch_tags": [str(t) for t in branch_tags],
+             "timing": {"infer_ms": float(infer_ms)},
+         }
+ 
