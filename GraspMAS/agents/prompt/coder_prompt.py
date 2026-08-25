@@ -59,6 +59,14 @@ class ImagePatch:
         Return the best 6-DoF grasp pose for the given object_patch (which carries the mask of the
         object or object part). Returns a dict with 3D position in metres, approach and closing
         direction vectors, a confidence score, and the gripper jaw width. Returns None on failure.
+    find_by_id(object_id: str)->ImagePatch
+        Return the object with a given stable instance id, e.g. "obj_003". Use this instead of
+        find() whenever the plan names an id: find() cannot tell two identical objects apart.
+        Only available while clearing a cluttered table.
+    place_detection(object_patch: ImagePatch, grasp: dict, keep_clear: str = None)->dict
+        Return where to set an object down after grasping it. Needed whenever the plan says to
+        move something out of the way, since a grasp alone cannot relocate anything. Returns None
+        when the surface has no room for it.
     """
 
     def __init__(self, image, left: int = None, lower: int = None, right: int = None, upper: int = None):
@@ -300,6 +308,79 @@ class ImagePatch:
         """
         return find_part(object_name, part_name)
         
+    def find_by_id(self, object_id: str) -> ImagePatch:
+        """Returns the object the plan named, by its stable instance id.
+
+        Only available while clearing a cluttered table. When the plan names an id like
+        "obj_003", use this instead of find(): find() re-runs detection and returns a list
+        whose order is not stable, so with two bottles on the table "the bottle" can mean a
+        different object each time. An id always means the same physical object.
+
+        Parameters
+        ----------
+        object_id : str
+            an instance id from the plan, e.g. "obj_003"
+
+        Returns
+        -------
+        ImagePatch
+            the patch for that instance
+
+        Examples
+        --------
+        >>> # Grasp the object the plan named
+        >>> def execute_command(image):
+        >>>     image_patch = ImagePatch(image)
+        >>>     bottle = image_patch.find_by_id("obj_003")
+        >>>     return image_patch.grasp_detection(bottle)
+        """
+        return ImagePatch(image)
+
+    def place_detection(object_patch: ImagePatch, grasp: dict, keep_clear: str = None)->dict:
+        """Returns where to put an object down after grasping it.
+
+        Use this whenever the plan says to move an object out of the way. A grasp alone
+        cannot relocate anything: the pick and the place are both needed.
+
+        The object is released in the orientation it was picked up in, so only its position
+        changes. The place location is chosen to be flat, empty, big enough for the object,
+        and clear of the target named by keep_clear - otherwise clearing an object could
+        mean setting it back down in front of the thing you were trying to reach.
+
+        Parameters
+        ----------
+        object_patch : ImagePatch
+            the object being moved
+        grasp : dict
+            the grasp returned by grasp_detection for that object
+        keep_clear : str, optional
+            the instance id that must not end up obstructed again, i.e. the target
+
+        Returns
+        -------
+        dict
+            A dict with these keys, or None if there is nowhere to put the object:
+              "pose"        - 4x4 release pose (camera frame, metres)
+              "position"    - [x, y, z] release position in metres
+              "travel_m"    - how far the object moves
+              "clearance_m" - free space around the chosen spot
+              "waypoints"   - the poses to move through, in order
+
+        None is a real answer. It means the surface has no room for this object, and a
+        different object should be moved instead.
+
+        Examples
+        --------
+        >>> # Move the bottle out of the banana's way
+        >>> def execute_command(image):
+        >>>     image_patch = ImagePatch(image)
+        >>>     bottle = image_patch.find_by_id("obj_003")
+        >>>     grasp = image_patch.grasp_detection(bottle)
+        >>>     place = image_patch.place_detection(bottle, grasp, keep_clear="obj_001")
+        >>>     return {{"grasp": grasp, "place": place}}
+        """
+        return {{}}
+
     def grasp_detection(object_patch: ImagePatch, gripper_name: str = None)->dict:
         """Returns the best 6-DoF grasp pose for the object/part in the object_patch.
 

@@ -10,6 +10,7 @@ The GraspGen-X client is mocked throughout — no server, no GPU.
 
 import resource
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -232,6 +233,60 @@ class TestGraspDetection:
         # Scoring against itself in the OCID layout must be a hit.
         gt = [rect[1], rect[2], rect[3], rect[4], rect[5], 0]
         assert eval_grasp(rect, [gt], dataset_type="OCID") is True
+
+
+class TestFindById:
+    """The tool the whole duplicate-object design routes through.
+
+    It had no test at all: it was implemented, advertised in the Coder prompt,
+    and only ever reached when a live model chose to call it. The first live run
+    that did raised `'Image' object has no attribute 'shape'` on every call, and
+    the Coder silently fell back to `find()` — which is the ambiguity ids exist
+    to remove.
+    """
+
+    @staticmethod
+    def _registry(mask, label="bottle", object_id="obj_003"):
+        inst = SimpleNamespace(id=object_id, label=label, mask=mask)
+        return SimpleNamespace(get=lambda oid: inst if oid == object_id else None)
+
+    def test_returns_a_patch_covering_the_registered_mask(
+        self, monkeypatch, rgb, box_mask
+    ):
+        monkeypatch.setattr(ip, "REGISTRY", self._registry(box_mask))
+        patch = ip.ImagePatch(rgb).find_by_id("obj_003")
+
+        assert patch.name == "obj_003"
+        assert patch.mask is not None
+        ys, xs = np.nonzero(box_mask)
+        # The crop must contain every masked pixel; `crop` flips rows, so an
+        # off-by-height error here silently returns a patch of empty background.
+        assert patch.left <= xs.min() and patch.right >= xs.max()
+        assert patch.mask.sum() > 0
+
+    def test_the_patch_is_usable_by_grasp_detection(
+        self, monkeypatch, rgb, box_mask, patch_env
+    ):
+        """The actual call chain: find_by_id -> grasp_detection."""
+        monkeypatch.setattr(ip, "REGISTRY", self._registry(box_mask))
+        patch_env.grasps, patch_env.scores = grasps_at([(0.0, 0.0, 0.6)], [0.9])
+
+        root = ip.ImagePatch(rgb)
+        result = root.grasp_detection(root.find_by_id("obj_003"))
+        assert result is not None and "pose" in result
+
+    def test_raises_a_useful_error_outside_the_declutter_loop(
+        self, monkeypatch, rgb
+    ):
+        monkeypatch.setattr(ip, "REGISTRY", None)
+        with pytest.raises(RuntimeError, match="registry"):
+            ip.ImagePatch(rgb).find_by_id("obj_003")
+
+    def test_rejects_an_empty_mask(self, monkeypatch, rgb):
+        empty = np.zeros(rgb.shape[:2], dtype=bool)
+        monkeypatch.setattr(ip, "REGISTRY", self._registry(empty))
+        with pytest.raises(ValueError, match="empty mask"):
+            ip.ImagePatch(rgb).find_by_id("obj_003")
 
 
 class TestGripperGeometry:

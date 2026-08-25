@@ -13,31 +13,90 @@
 
 provider: gemini
 base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+
+# --- keys ------------------------------------------------------------------
+# SEVERAL keys are supported and strongly recommended. Free-tier quota is
+# metered per Google Cloud PROJECT, so keys from separate accounts have
+# separate buckets and N keys multiply both the per-minute and the per-day
+# limit by N. (Keys from the SAME project share one bucket and buy nothing.)
+#
+# Every source below is merged, in this order, and de-duplicated:
+#   1. $LLM_API_KEY            — one key, or several separated by commas/spaces
+#   2. $LLM_API_KEY_1, _2, ... — numbered, in numeric order
+#   3. api.key                 — ONE KEY PER LINE; blank lines and # comments
+#                                are ignored
+# A single key in any one of them behaves exactly as it did before.
 api_key_env: LLM_API_KEY
 api_key_file: api.key
+
+# How the next request picks a key:
+#   least_used   fewest requests today, then fewest in the current minute.
+#                Self-balancing, and it carries usage across runs.
+#   round_robin  strict rotation, ignoring history.
+#   sticky       exhaust key 1, then key 2, ...
+key_selection: least_used
+
+# Remembers which (key, model) pairs are out of DAILY quota, so the next run
+# does not spend a request rediscovering it. Fingerprints only — the last four
+# characters of a key — never the keys themselves.
+quota_state_file: .llm_quota.json
 
 # Resolved against the live /models list at startup: the first id here that the
 # key can actually reach wins. Free-tier model availability changes often, so a
 # hard pin ages badly; run `python -m agents.llm --probe` to see the live list.
+#
+# ORDER IS BY FREE-TIER QUOTA, NOT BY CAPABILITY. Measured 2026-08-20 against a
+# live key: gemini-3.5-flash allows 5 requests/minute and **20 requests/day**,
+# which one declutter run exhausts before it finishes. The error body is the
+# only place those numbers appear — the published limits table does not break
+# them down per model, so probe rather than assume:
+#     python -m agents.llm --probe
+# The flash-lite family is the documented high-volume tier and had quota left
+# after 3.5-flash was exhausted; both handle vision, which the Observer needs.
+# A smarter model is worthless here if the run cannot reach its third iteration.
 model_candidates:
+  - gemini-3.1-flash-lite
+  - gemini-flash-lite-latest
   - gemini-3.5-flash
   - gemini-3.6-flash
-  - gemini-3-flash
-  - gemini-2.5-flash
   - gemini-flash-latest
 vision_model_candidates:
+  - gemini-3.1-flash-lite
+  - gemini-flash-lite-latest
   - gemini-3.5-flash
   - gemini-3.6-flash
-  - gemini-3-flash
-  - gemini-2.5-flash
   - gemini-flash-latest
 
-# Free tier is ~10-15 RPM. GraspMAS issues 3+ calls per round, and main_batch
-# runs asyncio.gather over a batch, so without pacing the very first batch 429s.
-rate_limit_rpm: 10
+# Pacing, PER KEY. GraspMAS issues 3+ calls per round and main_batch runs
+# asyncio.gather over a batch, so without this the very first batch 429s.
+#
+# This is per key because the limit it models belongs to a project's quota, not
+# to this process: with 5 keys the pool sustains 5 x 8 = 40 rpm and only ever
+# sleeps if every key is simultaneously at its own limit. A per-minute 429 is
+# absorbed by ROTATING to another key with no delay, not by backing off — a
+# 60 s pause mid-manipulation is a fault on a real arm, not a rate limit.
+rate_limit_rpm: 8
 max_retries: 5
 timeout_s: 120
 retry_base_delay_s: 2.0
+
+# --- thinking models -------------------------------------------------------
+# Gemini 3.x reasons before it answers, and those thinking tokens are billed as
+# output and drawn from the SAME max_tokens budget as the reply. Measured on
+# gemini-3.5-flash: 780-860 thinking tokens per call. The agents ask for
+# 900-1000, so the visible reply got 33-118 tokens, every structured answer was
+# truncated mid-JSON, and the task planner aborted the run on iteration 0 after
+# failing to parse twice. Neither symptom names the cause: what you see is a
+# model that "cannot follow the output format".
+#
+# min_max_tokens raises every request to a floor that fits reasoning AND a
+# reply. reasoning_effort bounds the thinking itself — the compat layer maps it
+# to Gemini's thinking_level. Every agent here fills in an explicit schema,
+# which is not a task extended deliberation improves.
+#
+# Setting either to null restores the raw provider behaviour.
+reasoning_effort: low
+min_max_tokens: 2048
 
 # Gemini's OpenAI-compat layer ignores or rejects some OpenAI parameters.
 # Anything listed here is stripped before the request is sent.

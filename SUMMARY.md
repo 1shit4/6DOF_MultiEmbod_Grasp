@@ -27,7 +27,7 @@ What is verified working, on real RGB-D:
 | Part-level grounding reaching the sampler | ✅ demonstrated (§4) |
 | RGB-only monocular fallback | ✅ works, with ~17% scale error (§6) |
 | CPU inference | ✅ 2–13 s/call, 2.6 GB peak RSS |
-| Offline test suite | ✅ 218 tests, ~25 s, no GPU/network/LLM |
+| Offline test suite | ✅ 606 tests, ~6 min, no GPU/network/LLM |
 
 The old pipeline returned `[quality, x, y, w, h, angle]` — an image-plane
 rectangle. The new one returns a 4×4 SE(3) pose in metres, in the camera frame,
@@ -219,14 +219,24 @@ GroundingDINO+SAM), rotation validity, ZMQ transport, unit conversion.
    completes the far side plausibly but not truthfully; the visibility filter
    exists precisely because that completion cannot be trusted for approach
    planning.
-5. **No scene-collision filtering.** Grasps are checked against the target's
-   mask and the viewing ray, not against neighbouring objects. GraspGen-X ships
-   `filter_collisions` but it needs a gripper collision mesh and a scene cloud;
-   in clutter, expect the arm to want a path that another object occupies.
+5. ~~**No scene-collision filtering.**~~ **Fixed** (2026-08-19). Candidates are
+   now checked against the whole scene minus the target, using the 10,500-point
+   gripper surface each description ships in `points.json` and a `cKDTree`
+   proximity query — no mesh, no FCL. 200 ms for 200 candidates against a
+   15k-point scene. See §11.
 6. **CPU latency.** 2–13 s per grasp call. Acceptable interactively, limiting for
    large sweeps.
 7. **ManiSkill is out of scope** — SAPIEN needs a Vulkan GPU to render camera
-   images, so the simulation demo cannot run here at all.
+   images, so the simulation demo cannot run here at all. A CPU physics backend
+   (PyBullet) *is* viable and is the deferred next step for §11.
+8. **Decluttering runs against scene mutation, not physics.** Objects are moved
+   and the scene re-rendered; nothing topples, rolls or settles on its own.
+   Failures are injected explicitly, which means the evaluator has only ever
+   been tested against failures somebody thought of. This is the biggest gap in
+   §11 and it is deliberate rather than overlooked.
+9. **Placement is 2.5D and one object at a time.** Objects are set down on the
+   support surface, never stacked or nested, and obstructions are cleared
+   individually — a situation needing two objects swapped will not be solved.
 
 ---
 
@@ -269,3 +279,144 @@ default here.
   success rate remains the honest missing number.
 * **A full OCID-VLG sweep** becomes practical in hours rather than days —
   though the LLM free tier, not the GPU, is the binding constraint there.
+
+
+---
+
+## 11. Clutter: reaching an object that is not reachable
+
+Added 2026-08-19. Everything above answers "where do I grasp X?". This answers
+"X is behind two other things — now what?", by clearing obstructions one at a
+time until the target can be grasped. Design and full findings:
+[`CLAUDE.md`](CLAUDE.md) §7 and [`docs/declutter.md`](docs/declutter.md).
+
+### Measured
+
+Reproduce with `conda run -n graspmas python scripts/verify_declutter.py`
+(75/75 checks, no API key, no GPU, no server). Scene: a banana 32% visible
+behind a bottle and a mug, plus a distractor box that must be left alone.
+
+| | |
+|---|---|
+| result | target reached in **2 moves**, 3 iterations |
+| target visibility | 32% → **100%** |
+| placement accuracy | objects landed **1.5–2.0 cm** from plan |
+| distractor | never touched |
+| target | never moved |
+| support-plane fit | 0.05° / 0.03 mm (synthetic); 47–50% inliers (real scenes) |
+| scene-collision filter | 200 ms for 200 candidates vs. a 15k-point cloud |
+
+Under injected execution failure (`drop`, `offset`, `collateral`,
+`wrong_object`) the loop terminated with a stated reason in every case — never
+ran to its cap by accident, never claimed a success it had not achieved.
+
+### The three ways an object is "in the way"
+
+A loop that implements only the visible one strands itself. Measured on the same
+scene: the bottle blocks by **occlusion** and **approach**, the mug by
+**proximity** while occluding almost nothing, and the distractor by none.
+
+While the target is heavily occluded, only occlusion can be measured at all — a
+footprint fitted to a 19%-visible object comes out 11.8 cm short, so the
+geometric tests would return confident nonsense. They switch on once the target
+is uncovered, and reliably find the second-order blockers then. The loop
+establishes obstructions in the only order it can.
+
+### The finding that mattered most
+
+Placement needs a keep-out region, and without one the loop does not terminate:
+
+| placement keep-out | objects moved | outcome |
+|---|---|---|
+| none | `mug, bottle, bottle, bottle` (hit the cap) | banana 81% visible, **still blocked** |
+| enabled | `mug, bottle` | banana **100%** visible, done |
+
+The nearest cell with enough clearance is very often directly in front of the
+target, so the loop lifts the bottle and sets it back down over the banana. The
+keep-out took three attempts to get right — a table-space wedge, then an
+image-space column, then an image-space column of the object's actual width
+protecting the target's mask *unioned with the mover's own silhouette*. Each
+failure was found by measurement, not by review; the details are in `CLAUDE.md`
+§7.5.
+
+### The evaluator is arithmetic
+
+Whether a move worked is measurable — centroid displacement, distance to the
+planned position, and a re-run of the blocking test — so no LLM is involved. A
+VLM call fires only when geometry genuinely cannot decide, which in a healthy
+run is never.
+
+It reports **two independent verdicts**, and the planner acts on the second:
+
+* the grasp slipped but the object is clear → the action *failed*, and **nothing
+  needs redoing**;
+* the object went exactly where it was told and still obstructs → the action
+  *succeeded*, and **the plan was wrong**.
+
+Conflating those is how a long-horizon loop either repeats work forever or stops
+early convinced it is done.
+
+### Still missing
+
+The honest number remains the same one §10 names: **no grasp here, in clutter or
+otherwise, has been executed on a robot or in physics.** Scene mutation proves
+the perception, planning and bookkeeping are coherent; it cannot tell you whether
+the hand would actually have closed on the bottle.
+
+### With the LLM actually driving it
+
+Added 2026-08-20; re-recorded 2026-08-23 with full per-iteration capture and
+one-shot fault injection. Everything above was verified **geometrically** — a
+scripted planner, no model in the loop. This is the same loop with Gemini
+choosing what to move next. Six runs plus a no-LLM control on identical
+machinery, `gemini-3.1-flash-lite`, `--max-round 2`, under
+`outputs/runs/20260823T1*`.
+
+**Read them at [`outputs/reports/index.md`](outputs/reports/index.md)** — one
+`report.md` per run, walking each iteration through the task planner's decision,
+the grasping agents' reasoning round by round, the executor's report, and the
+evaluator's verdict, with the scene before and after each action inline.
+
+Each fault fires **once**, on the first pick-and-place. That is what makes
+these recovery tests: injecting on every attempt makes the task impossible by
+construction, and such a run can only ever show that the loop gives up.
+
+| injected failure | outcome | iterations | how it recovered |
+|---|---|---|---|
+| none | **success** | 3 | grasp scores 0.51 / 0.73 / **0.89**, placed 2.0 and 1.5 cm from plan |
+| `drop` | **success** | 4 | `not_moved`; diversified to the other blocker, then came back and retried |
+| `wrong_object` | **success** | 5 | `not_moved` plus the bystander reported gone; retried |
+| `offset` | **success** | 3 | released 8 cm off plan, still cleared, correctly not retried |
+| `collateral` | **success** | 3 | intended move fine; the knock is in the executor's report |
+| `tip` | **success** | 3 | position correct, so geometry sees success |
+
+A clean run is 3 iterations, so recovery costs at most one — two for
+`wrong_object`. With `--inject-at every` the fault never lifts and the loop is
+expected to fail; it does, in 2 iterations, with a named diagnosis rather than
+running to the cap.
+
+Every grasp in the clean run came from GraspGen-X through the
+Planner/Coder/Observer loop — **no geometric fallbacks**. Both failures stopped
+at 2 iterations through stall detection rather than running to the 6-iteration
+cap, and both said why. 76 LLM calls across the five runs, none truncated, none
+unparseable.
+
+**The interesting result is the retry policy on `drop`.** The planner wrote
+*"the first attempt to remove obj_002 failed because the grasp did not take
+hold... I will switch to the other occluder"*, and two iterations later *"while
+the first attempt to move it failed (grasp slip), it remains the only identified
+obstruction. I must attempt to remove it again"*. Diversify away from a fault,
+then come back when retrying is the only move left — and on `offset`, retry
+nothing at all, because both objects had stopped blocking despite the releases
+being judged `moved_off_target`. That distinction is the entire reason the
+evaluator returns two independent verdicts.
+
+**It did not work first time.** Seven defects had to be fixed, and none was
+reachable without a live model — `find_by_id` had never once been executed,
+instance ids never reached the Coder, thinking tokens consumed the entire reply
+budget, an agent could poison its own state file, and a provider outage crashed
+the run rather than ending it. Full account in [`CLAUDE.md`](CLAUDE.md) §7.11.
+
+**Still not tested:** the Observer's *semantic* critique. It misreads synthetic
+scenes — asked whether a grasp is on "the mug" it sees a red cylinder and
+reports a mismatch — so these runs exercise the loop, not the VLM's grounding.

@@ -5,8 +5,10 @@
 #                                        #   no network, no LLM requests
 #   scripts/run_tests.sh --integration   # also the tests needing a live server
 #
-# The default run is deliberately free and fast: the free LLM tier has a daily
-# request budget that belongs to real evaluation, not to CI.
+# The default run is deliberately free: the LLM tier has a daily request budget
+# that belongs to real evaluation, not to CI. It takes ~5 minutes, most of it
+# ray-casting synthetic scenes and rebuilding scene registries — the price of
+# testing the decluttering loop against ground truth rather than against mocks.
 
 set -uo pipefail
 

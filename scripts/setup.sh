@@ -125,6 +125,9 @@ Next:
   1. Free LLM key (needed only for the agent loop):
        https://aistudio.google.com/apikey
        export LLM_API_KEY=...          # or write it to GraspMAS/api.key
+       Several keys are supported: one per line in GraspMAS/api.key, or
+       comma-separated in LLM_API_KEY. Quota is per project, so keys from
+       separate accounts multiply the rate and the daily budget.
        conda run -n graspmas python -m agents.llm --probe --test
 
   2. Start the GraspGen-X server (holds the model; leave it running):

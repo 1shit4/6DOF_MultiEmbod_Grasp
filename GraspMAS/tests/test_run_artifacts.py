@@ -104,13 +104,36 @@ class TestLlmTrace:
         assert json.loads(lines[0])["agent"] == "planner"
         assert recorder.llm_call_count == 3
 
-    def test_truncates_huge_prompts(self, recorder):
+    def test_elides_huge_prompts_from_the_middle(self, recorder):
+        """Both ends are kept, because both ends carry information.
+
+        These prompts are `str.format()` templates: the static instructions and
+        examples come first, and the scene table, blocking analysis and history
+        the model is meant to reason from are interpolated at the very end.
+        Head-only truncation kept the boilerplate and dropped the evidence,
+        which made a trace useless for deciding whether a bad decision was the
+        model's fault or the prompt's.
+        """
+        head, tail = "HEAD" + "x" * 50_000, "y" * 50_000 + "TAIL"
         recorder.log_llm_call(agent="coder", model="m", provider="p",
-                              prompt="x" * 50_000, response="y" * 50_000,
+                              prompt=head + tail, response=head + tail,
                               latency_s=0.1)
         rec = json.loads((recorder.dir / "llm_trace.jsonl").read_text())
-        assert len(rec["prompt"]) <= 4000
-        assert len(rec["response"]) <= 4000
+
+        for field in ("prompt", "response"):
+            text = rec[field]
+            assert len(text) < 12_000, f"{field} was not elided"
+            assert text.startswith("HEAD")
+            assert text.endswith("TAIL")
+            assert "elided" in text
+
+    def test_short_prompts_are_stored_whole(self, recorder):
+        recorder.log_llm_call(agent="coder", model="m", provider="p",
+                              prompt="short prompt", response="short reply",
+                              latency_s=0.1)
+        rec = json.loads((recorder.dir / "llm_trace.jsonl").read_text())
+        assert rec["prompt"] == "short prompt"
+        assert "elided" not in rec["response"]
 
     def test_records_errors_and_retries(self, recorder):
         recorder.log_llm_call(agent="observer", model="m", provider="p",

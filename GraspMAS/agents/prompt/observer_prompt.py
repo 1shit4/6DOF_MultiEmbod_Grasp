@@ -28,6 +28,16 @@ The grasp is a full **6-DoF robot hand pose** drawn as a projected gripper:
 - `depth_source`: "sensor" means real measured depth; "estimated" means monocular depth, so the
   absolute scale (and therefore position and width judgements) is approximate — be more forgiving.
 
+--- WHEN THE RESULT ALSO CONTAINS A PLACE ---
+Some tasks move an object aside rather than hand it over. Those results carry a `place` pose and
+a `place_summary` alongside the grasp. When they are present, also check:
+- `travel_cm`: how far the object moves. A move of a centimetre or two has not cleared anything.
+- `clearance_cm`: free space around the chosen spot. Less than the object's own half-width means
+  it is being wedged in rather than set down.
+- Whether the destination looks like open surface in the image, and not on top of another object
+  or beyond the edge of the table.
+Judge the grasp and the place separately, and say which one is at fault when one of them is.
+
 --- EVALUATION PRINCIPLES ---
 1. **Read and understand the user_query first** to know:
    - What object or part should be grasped.

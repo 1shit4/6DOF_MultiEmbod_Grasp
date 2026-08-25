@@ -36,5 +36,10 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
-# Free-tier LLM key. Prefer the env var; GraspMAS/api.key is the fallback.
+# Free-tier LLM keys. Several are supported and recommended: quota is per
+# Google Cloud project, so keys from separate accounts multiply both the
+# per-minute and the per-day limit. Any of these work, and all are merged:
+#   export LLM_API_KEY="key1,key2,key3"
+#   export LLM_API_KEY_1=... LLM_API_KEY_2=...
+#   GraspMAS/api.key, one key per line
 # export LLM_API_KEY=...

@@ -42,6 +42,33 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+LLM_TRACE_HEAD = 3000
+LLM_TRACE_TAIL = 5000
+
+
+def _elide(text: str, head: int = LLM_TRACE_HEAD, tail: int = LLM_TRACE_TAIL) -> str:
+    """Trim a prompt or reply for the trace, keeping both ends.
+
+    Head-only truncation loses exactly what is worth reading. These prompts are
+    `str.format()` templates whose static instructions and examples come first
+    and whose *variable* content — the scene table, the blocking analysis, the
+    history the planner is supposed to be reasoning from — is interpolated at
+    the very end. Cutting at 4000 characters kept the boilerplate and dropped
+    the evidence, which made a trace useless for deciding whether a bad
+    decision was the model's fault or the prompt's.
+    """
+    text = text or ""
+    if len(text) <= head + tail:
+        return text
+    dropped = len(text) - head - tail
+    return f"{text[:head]}\n\n... [{dropped} characters elided] ...\n\n{text[-tail:]}"
+
+
+def _safe_name(text: str, limit: int) -> str:
+    """Filesystem-safe stem. Object labels reach here and may contain `/`."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(text))[:limit]
+
+
 def _git_sha(path: Path) -> Optional[str]:
     try:
         out = subprocess.run(
@@ -85,6 +112,7 @@ class RunRecorder:
         self._t_start = time.time()
         self._stage_times: dict[str, float] = {}
         self._counters: dict[str, int] = {}
+        self._scope = ""
 
         if not enabled:
             self.dir = Path(os.devnull).parent
@@ -92,7 +120,7 @@ class RunRecorder:
 
         base = Path(root) if root else _repo_root() / "outputs" / "runs"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
+        safe = _safe_name(name, 60)
         self.dir = base / f"{stamp}_{safe}"
         for sub in ("inputs", "masks", "clouds", "grasps", "images"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
@@ -194,20 +222,37 @@ class RunRecorder:
         if meta:
             self._write_json("inputs/meta.json", meta)
 
+    # -- scoping -----------------------------------------------------------
+
+    def set_scope(self, scope: Optional[str]) -> None:
+        """Namespace everything written from now on, e.g. `set_scope("iter1")`.
+
+        Single-shot runs name artifacts by the inner round: `round0_overlay.png`,
+        `round0_<label>.npy`. A long-horizon run calls the inner loop once per
+        outer iteration, so those names repeat and each iteration silently
+        overwrites the last — the run finishes holding only the final pick, and
+        the visual record of how it got there is gone. Scoping puts images in
+        `images/<scope>/` and prefixes array filenames.
+        """
+        self._scope = _safe_name(scope, 24) if scope else ""
+
+    def _scoped(self, name: str) -> str:
+        return f"{self._scope}_{name}" if self._scope else name
+
     # -- per-call artifacts ------------------------------------------------
 
     def save_mask(self, mask: np.ndarray, label: str, round_idx: int = 0) -> None:
         if not self.enabled:
             return
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:40]
-        np.save(self.dir / "masks" / f"round{round_idx}_{safe}.npy",
+        safe = _safe_name(label, 40)
+        np.save(self.dir / "masks" / self._scoped(f"round{round_idx}_{safe}.npy"),
                 np.asarray(mask).astype(bool))
 
     def save_cloud(self, cloud: np.ndarray, label: str, round_idx: int = 0) -> None:
         if not self.enabled:
             return
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:40]
-        np.save(self.dir / "clouds" / f"round{round_idx}_{safe}.npy",
+        safe = _safe_name(label, 40)
+        np.save(self.dir / "clouds" / self._scoped(f"round{round_idx}_{safe}.npy"),
                 np.asarray(cloud, np.float32))
 
     def save_grasps(
@@ -226,7 +271,7 @@ class RunRecorder:
         """
         if not self.enabled:
             return
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:40]
+        safe = _safe_name(label, 40)
         payload = {
             "grasps": np.asarray(grasps, np.float32),
             "scores": np.asarray(scores, np.float32),
@@ -236,15 +281,24 @@ class RunRecorder:
         if meta:
             payload["meta_json"] = np.array(json.dumps(meta, cls=JsonNumpyEncoder))
         np.savez_compressed(
-            self.dir / "grasps" / f"round{round_idx}_{safe}.npz", **payload
+            self.dir / "grasps" / self._scoped(f"round{round_idx}_{safe}.npz"),
+            **payload,
         )
 
     def image_path(self, filename: str) -> Path:
-        return self.dir / "images" / filename
+        return self.images_dir / filename
 
     @property
     def images_dir(self) -> Path:
-        return self.dir / "images"
+        """Where images go. A scoped run gets a subdirectory of its own.
+
+        Created on access rather than up front: callers write straight into
+        this path, and a scope set after `__init__` has no directory yet.
+        """
+        path = self.dir / "images" / self._scope if self._scope else self.dir / "images"
+        if self.enabled:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
 
     # -- LLM trace ---------------------------------------------------------
 
@@ -260,6 +314,8 @@ class RunRecorder:
         retries: int = 0,
         error: Optional[str] = None,
         has_image: bool = False,
+        key: Optional[str] = None,
+        key_fingerprint: Optional[str] = None,
     ) -> None:
         self._counters["llm_calls"] = self._counters.get("llm_calls", 0) + 1
         self._append_jsonl(
@@ -267,17 +323,26 @@ class RunRecorder:
             {
                 "i": self._counters["llm_calls"],
                 "t": round(time.time() - self._t_start, 3),
+                # Which outer iteration this call belongs to. Without it the
+                # trace is a flat list and no report can say which decision led
+                # to which pick — the scope the loop already sets per iteration
+                # is exactly the attribution needed.
+                "iteration": self._scope or None,
                 "agent": agent,
                 "provider": provider,
                 "model": model,
+                # Which key served the call. A label and the last four
+                # characters — never the key itself — so a run can be audited
+                # for rotation without the trace becoming a credential.
+                "key": key,
+                "key_fingerprint": key_fingerprint,
                 "has_image": has_image,
                 "latency_s": round(latency_s, 3),
                 "retries": retries,
                 "usage": usage or {},
                 "error": error,
-                # Truncated: full prompts are large and mostly static boilerplate.
-                "prompt": prompt[:4000],
-                "response": response[:4000],
+                "prompt": _elide(prompt),
+                "response": _elide(response),
             },
         )
 

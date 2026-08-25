@@ -52,13 +52,39 @@ class GraspMAS:
 
         self.plan = None
         self.observation = None
+        self.observation_json = None
         self.code = None
         self.thought = None
+        # Every round, not just the last. The fields above are overwritten each
+        # round, so after a query only the final round survived — which is
+        # enough to decide what to do next and useless for explaining how the
+        # loop got there.
+        self.rounds: list[dict] = []
         self.max_round = max_round
 
         self.gripper_name = gripper_name
         self.num_grasps = num_grasps
         self.grasp_planner = planner
+
+    def reset(self) -> None:
+        """Clear the state carried between rounds.
+
+        `query()` does not do this, so a second call inherits the first's plan
+        and observation. Harmless for a one-shot run, wrong for anything that
+        calls `query` more than once — the decluttering loop calls it per
+        object, and `main_batch.py` per sample, where it silently leaks one
+        sample's reasoning into the next.
+        """
+        self.plan = None
+        self.observation = None
+        self.observation_json = None
+        self.code = None
+        self.thought = None
+        # Every round, not just the last. The fields above are overwritten each
+        # round, so after a query only the final round survived — which is
+        # enough to decide what to do next and useless for explaining how the
+        # loop got there.
+        self.rounds: list[dict] = []
 
     @staticmethod
     def _prepare_image(
@@ -133,6 +159,16 @@ class GraspMAS:
             print("----- Plan -----\n", self.plan)
 
             if "return to user" in (self.plan or "").lower():
+                # Recorded rather than dropped: "the grasp is good, stop" is a
+                # decision, and a report that omits it looks like the loop ran
+                # out of rounds instead of finishing.
+                self.rounds.append({
+                    "round": idx,
+                    "query": query,
+                    "thought": self.thought,
+                    "plan": self.plan,
+                    "concluded": True,
+                })
                 break
 
             with self.recorder.stage("coder"):
@@ -154,6 +190,27 @@ class GraspMAS:
                 observation = await self.observer(result, query)
             print("----- Observation -----\n", observation)
             self.observation = observation.get("summary", "")
+            # The Observer's verdict and checklist used to be discarded here.
+            # The prompt tells the Planner to reason from the summary alone, and
+            # that stays true — but the *outer* loop needs a programmatic signal
+            # of whether a grasp was judged sound, and it was already being
+            # computed and thrown away.
+            self.observation_json = observation
+
+            self.rounds.append({
+                "round": idx,
+                "query": query,
+                "thought": self.thought,
+                "plan": self.plan,
+                "code": self.code,
+                "grasp": result.get("grasp"),
+                "grasp_summary": result.get("grasp_summary"),
+                "place": result.get("place"),
+                "place_summary": result.get("place_summary"),
+                "error_logs": result.get("error_logs"),
+                "overlay_image": result.get("image"),
+                "observer": observation,
+            })
 
         status = "success" if grasp_pose is not None else "no_grasp"
         self.recorder.finish(result=grasp_pose, status=status)
@@ -190,12 +247,24 @@ class GraspMAS:
         result = {
             "grasp": None,
             "grasp_summary": None,
+            "place": None,
+            "place_summary": None,
             "image": str(image_path),
             "error_logs": None,
         }
 
         # The upstream gate was `isinstance(out_raw, list)`, matching the old
         # [quality, x, y, w, h, angle] rectangle. 6-DoF grasps are dicts.
+        #
+        # A pick-and-place returns `{"grasp": ..., "place": ...}` instead, so
+        # both shapes are accepted and the grasp is unwrapped. A plain grasp
+        # dict still passes unchanged, which is what keeps `main_simple.py` and
+        # the existing tests working.
+        place = None
+        if isinstance(out_raw, dict) and "grasp" in out_raw:
+            place = out_raw.get("place")
+            out_raw = out_raw.get("grasp")
+
         is_grasp = isinstance(out_raw, dict) and "pose" in out_raw
         if not is_grasp:
             result["error_logs"] = out_raw if isinstance(out_raw, str) else (
@@ -232,6 +301,14 @@ class GraspMAS:
             "jaw_width_cm": round(grasp.width * 100, 1),
             "depth_source": scene.depth_source,
         }
+
+        if place is not None:
+            result["place"] = place
+            result["place_summary"] = {
+                "position_m": [round(float(v), 3) for v in place.get("position", [])],
+                "travel_cm": round(float(place.get("travel_m", 0.0)) * 100, 1),
+                "clearance_cm": round(float(place.get("clearance_m", 0.0)) * 100, 1),
+            }
         return result
 
     @staticmethod

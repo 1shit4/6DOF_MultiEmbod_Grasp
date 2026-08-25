@@ -70,6 +70,50 @@ def identity_grasp():
     return Grasp6D(pose=pose, score=0.9, gripper="franka_panda", width=0.08)
 
 
+@pytest.fixture(scope="session")
+def tabletop():
+    """The `occluded_target` synthetic scene, rendered once for the whole run.
+
+    Ray-cast rather than splatted, so `plane_truth` is exact and the tests can
+    assert against ground truth instead of against themselves. Session-scoped
+    because rendering is the slowest thing in the offline suite and nothing
+    mutates the result.
+    """
+    import synth_scene
+
+    return synth_scene.build("occluded_target")
+
+
+@pytest.fixture(scope="session")
+def tabletop_cloud(tabletop):
+    """The full scene cloud of `tabletop`, camera frame, metres."""
+    from perception3d import unproject
+
+    return unproject(tabletop["depth"], tabletop["K"], max_depth=5.0)
+
+
+@pytest.fixture(scope="session")
+def tabletop_plane(tabletop_cloud):
+    """The support plane fitted from `tabletop_cloud`."""
+    from placement import fit_support_plane
+
+    return fit_support_plane(tabletop_cloud)
+
+
+@pytest.fixture
+def object_cloud_fn(tabletop):
+    """`fn(name) -> (N, 3)` camera-frame points of one object in `tabletop`."""
+    from perception3d import unproject
+
+    def _fn(name: str):
+        label = tabletop["label_map"][name]
+        return unproject(
+            tabletop["depth"], tabletop["K"], mask=(tabletop["seg"] == label)
+        )
+
+    return _fn
+
+
 @pytest.fixture
 def synthetic_box_cloud():
     """Surface points of a 6x6x12 cm box at 60 cm, deterministic."""

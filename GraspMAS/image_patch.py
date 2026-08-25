@@ -18,6 +18,11 @@ from vlpart.vlpart import build_vlpart
 import detectron2.data.transforms as T
 
 from agents.llm import get_shared_llm
+from collision import (
+    filter_grasps_by_scene_collision,
+    load_gripper_points,
+    scene_cloud_excluding,
+)
 from graspgen import GraspGenClient, GraspGenUnavailable
 from perception3d import (
     MAX_CLOUD_POINTS,
@@ -100,6 +105,23 @@ _GRASPGEN_CLIENT: Optional[GraspGenClient] = None
 # same mask, and on CPU a cache hit saves seconds per call.
 _GRASP_CACHE: dict = {}
 
+# The decluttering loop's instance registry, when one is running. It gives the
+# generated code `find_by_id` (unambiguous with duplicate objects) and gives
+# `grasp_detection` the rest of the scene to collision-check against.
+REGISTRY = None
+
+
+def set_registry(registry) -> None:
+    """Attach or detach the scene registry for the current iteration.
+
+    Separate from `configure_scene` because its lifetime is different: the
+    registry spans the whole run and carries ids across iterations, while the
+    scene context is rebuilt per capture.
+    """
+    global REGISTRY
+    REGISTRY = registry
+    _GRASP_CACHE.clear()
+
 
 def configure_scene(
     scene: Optional[SceneContext] = None,
@@ -125,6 +147,25 @@ def configure_scene(
         NUM_GRASPS = int(num_grasps)
     if planner is not None:
         PLANNER = planner
+
+
+def _scene_cloud_excluding(mask) -> Optional[np.ndarray]:
+    """The scene minus the object being grasped, for collision checking.
+
+    Returns None when there is no depth to work from, in which case the caller
+    skips the collision filter rather than rejecting everything.
+    """
+    try:
+        depth = SCENE.depth
+        if depth is None:
+            return None
+        K = SCENE.get_intrinsics(None) if SCENE.intrinsics is None else SCENE.intrinsics
+        if K is None:
+            return None
+        return scene_cloud_excluding(depth, K, exclude_mask=mask)
+    except Exception as exc:  # never let a filter break a working grasp path
+        logger.debug("could not build a scene cloud for collision checking: %s", exc)
+        return None
 
 
 def get_graspgen_client() -> GraspGenClient:
@@ -880,8 +921,32 @@ class ImagePatch:
                 "grasp_detection: none of %d visible grasps landed inside the "
                 "mask; ranking by score alone", len(visible)
             )
-        logger.info("grasp_detection: %d candidates -> %d visible -> %d on target",
-                    n_all, len(visible), len(keep))
+
+        # 3. Clutter. GraspGen-X is given one object's cloud and knows nothing
+        #    about its neighbours, so on a crowded table it will happily propose
+        #    a pose whose fingers pass straight through the mug alongside. On an
+        #    isolated object this filter is a no-op; in clutter it is the
+        #    difference between a plan and a collision.
+        n_on_target = len(keep)
+        scene_cloud = _scene_cloud_excluding(mask)
+        if scene_cloud is not None and len(scene_cloud):
+            gripper_pts = load_gripper_points(gripper)
+            clear = filter_grasps_by_scene_collision(
+                grasps[keep], scene_cloud, gripper_pts, approach_len=0.08
+            )
+            if len(clear):
+                keep = keep[clear]
+            else:
+                logger.warning(
+                    "grasp_detection: all %d on-target grasps collide with the "
+                    "rest of the scene; keeping them so the Observer can see why",
+                    n_on_target,
+                )
+
+        logger.info(
+            "grasp_detection: %d candidates -> %d visible -> %d on target -> %d clear",
+            n_all, len(visible), n_on_target, len(keep),
+        )
 
         best_local = int(np.argmax(scores[keep]))
         best_idx = int(keep[best_local])
@@ -915,6 +980,119 @@ class ImagePatch:
         result = grasp.as_dict()
         _GRASP_CACHE[cache_key] = result
         return result
+
+    def find_by_id(self, object_id: str) -> "ImagePatch":
+        """Return the registered instance `object_id` as a patch.
+
+        Prefer this over `find` whenever the plan names an instance. `find`
+        re-runs detection and returns a list whose order is not stable between
+        iterations, so with two bottles in the scene "the bottle" can silently
+        mean a different object each time. An id always means the same physical
+        object for as long as it stays on the table.
+
+        Examples
+        --------
+        >>> # Grasp the object the planner named
+        >>> def execute_command(image):
+        >>>     image_patch = ImagePatch(image)
+        >>>     bottle = image_patch.find_by_id("obj_003")
+        >>>     return image_patch.grasp_detection(bottle)
+        """
+        if REGISTRY is None:
+            raise RuntimeError(
+                "find_by_id needs a scene registry; it is only available inside "
+                "the decluttering loop. Use find(object_name) otherwise."
+            )
+        inst = REGISTRY.get(object_id)
+        ys, xs = np.nonzero(inst.mask)
+        if len(xs) == 0:
+            raise ValueError(f"{object_id} has an empty mask")
+
+        # `crop` takes bottom-left-origin coordinates, so the row indices have to
+        # be flipped against the full image height. Not `original_img.shape`:
+        # that attribute is a PIL Image, which has no `.shape`, so every call
+        # raised `'Image' object has no attribute 'shape'` and the Coder fell
+        # back to `find()`. The registry's mask is full-frame, so it agrees with
+        # `original_height` and covers a patch built without one.
+        height = int(getattr(self, "original_height", 0)) or int(inst.mask.shape[0])
+        patch = self.crop(
+            int(xs.min()), int(height - ys.max()), int(xs.max()), int(height - ys.min()),
+            inst.mask, inst.label,
+        )
+        patch.name = object_id
+        return patch
+
+    def place_detection(
+        self,
+        object_patch: "ImagePatch",
+        grasp: dict,
+        keep_clear: Optional[str] = None,
+        gripper_name: str = None,
+    ) -> Optional[dict]:
+        """Where to put `object_patch` down after grasping it at `grasp`.
+
+        Returns a dict with `pose` (4x4, camera frame), `waypoints` and the
+        clearance achieved, or None when there is nowhere on the surface that
+        fits it. None is a real answer — it means this object cannot be moved
+        usefully and a different one should be chosen.
+
+        The object is released in the orientation it was picked up in, so the
+        place pose is the grasp pose translated. `keep_clear` names the instance
+        that must not end up obstructed again; pass the target's id.
+
+        Examples
+        --------
+        >>> # Move the bottle out of the banana's way
+        >>> def execute_command(image):
+        >>>     image_patch = ImagePatch(image)
+        >>>     bottle = image_patch.find_by_id("obj_003")
+        >>>     grasp = image_patch.grasp_detection(bottle)
+        >>>     place = image_patch.place_detection(bottle, grasp, keep_clear="obj_001")
+        >>>     return {"grasp": grasp, "place": place}
+        """
+        import placement as pl
+
+        if grasp is None or not isinstance(grasp, dict) or "pose" not in grasp:
+            logger.warning("place_detection: no usable grasp to place from")
+            return None
+        if REGISTRY is None or REGISTRY.plane is None:
+            logger.warning("place_detection: needs a scene registry with a fitted plane")
+            return None
+
+        mask = getattr(object_patch, "mask", None)
+        if mask is None:
+            logger.warning("place_detection: the object patch has no mask")
+            return None
+
+        gripper = gripper_name or GRIPPER_NAME
+        cloud = unproject(SCENE.depth, SCENE.intrinsics, mask=np.asarray(mask).astype(bool))
+        if len(cloud) < MIN_OBJECT_POINTS:
+            logger.warning("place_detection: only %d object points", len(cloud))
+            return None
+
+        keep_out = None
+        if keep_clear is not None and keep_clear in REGISTRY.instances:
+            moving = getattr(object_patch, "name", None)
+            keep_out = REGISTRY.keep_out_for(
+                keep_clear, moving_id=moving if moving in REGISTRY.instances else None
+            )
+
+        place = pl.plan_place(
+            np.asarray(grasp["pose"], dtype=np.float64),
+            cloud,
+            REGISTRY.scene_cloud_excluding(),
+            REGISTRY.plane,
+            gripper=gripper,
+            width=float(grasp.get("width", 0.08)),
+            keep_out=keep_out,
+            hmap=REGISTRY.hmap,
+        )
+        if place is None:
+            logger.info("place_detection: no free space fits this object")
+            return None
+
+        logger.info("place_detection: %s", place.summary())
+        return place.as_dict()
 
     @staticmethod
     def _gripper_geometry(gripper_name: str) -> Tuple[float, float]:
