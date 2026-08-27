@@ -203,10 +203,29 @@ GroundingDINO+SAM), rotation validity, ZMQ transport, unit conversion.
 
 ## 8. Limitations
 
-1. **The agent loop is unexercised end-to-end.** Planner/Coder/Observer are
-   rewritten for 6-DoF, routed through the free-tier client, and covered by 218
-   offline tests against a stub LLM — but no real query has run, because that
-   needs an API key. Everything downstream of the Coder is verified.
+1. ~~**The agent loop is unexercised end-to-end.**~~ **Fixed** (2026-08-20 →
+   08-26). Runs with a live model are recorded under `outputs/runs/`, including
+   the full injected-failure matrix and abstract-goal runs.
+
+   **The live risk that replaced it: a label is not an object.** Target
+   selection reasons over *detector labels*, and everything downstream works on
+   an instance id and treats suitability as settled — so a confident wrong label
+   propagates with nothing able to catch it. Measured on real photographs
+   (`outputs/reports/target_selection_real_photos.md`): the planner *did* catch
+   one, declining "something to drink from" on a workbench whose table listed a
+   `bottle`, because the photo showed a screwdriver. That is encouraging and it
+   is not a guarantee.
+
+   Two consequences worth holding onto:
+   * **Detection is now the weaker half.** Real objects scored 0.39–0.93 and
+     pure hallucinations 0.15–0.30, so a low threshold lets an "apple" on a
+     photo of a tool set out-compete a real hammer. On a dense scene (30
+     near-identical tools, 330 boxes) a correctly-detected hammer was ranked out
+     of the table entirely, and the planner was asked to drive a nail with no
+     hammer in front of it.
+   * **Synthetic scenarios cannot test any of this.** They hand the planner the
+     literal label the scene author typed, so the perception-lies path only
+     exists on real captures.
 2. **Free-tier request budget.** ~1500 requests/day at 15–25 per query ≈ 60–100
    queries/day. Fine interactively; `main_batch.py` is `--limit`-ed and
    resumable for exactly this reason.
@@ -237,6 +256,13 @@ GroundingDINO+SAM), rotation validity, ZMQ transport, unit conversion.
 9. **Placement is 2.5D and one object at a time.** Objects are set down on the
    support surface, never stacked or nested, and obstructions are cleared
    individually — a situation needing two objects swapped will not be solved.
+10. **Suitability is a judgement, and it is the model's alone.** Which object
+    answers "something to cut" is decided in one call and validated only for
+    *existence* — Python checks the id is real and dense enough, never that the
+    choice is sensible. The guardrails bound how often it may change
+    (`retarget`: one, on evidence) and record when effort was traded against
+    suitability, but nothing second-guesses the judgement itself. On five real
+    photographs it was right 20/20; that is a sample of five.
 
 ---
 

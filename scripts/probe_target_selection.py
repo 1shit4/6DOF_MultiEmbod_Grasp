@@ -58,8 +58,19 @@ GOALS = [
 #: table needs and they survive downscaling perfectly well.
 MAX_EDGE_PX = 720
 
+#: At most this many instances of any one label, and this many objects overall.
+#: Per-label first: the overall cap alone lets one over-detected class evict
+#: every other object in the scene.
+MAX_PER_LABEL = 3
+MAX_DETECTIONS = 28
 
-def detect(image_path: Path, vocabulary, threshold: float = 0.15):
+#: Measured on these photographs: real objects score 0.39-0.93 while pure
+#: hallucinations sit at 0.15-0.30 — an "apple" and a "banana" on a photo of a
+#: tool set, a "glass" among the wrenches. At 0.15 that garbage out-competed a
+#: correctly-detected hammer (0.443) for a place in the table.
+
+
+def detect(image_path: Path, vocabulary, threshold: float = 0.35):
     """Real open-vocabulary detection. Returns a list of detection dicts.
 
     Boxes only — **no segmentation**. `ImagePatch.find` runs SAM per label, and
@@ -118,13 +129,33 @@ def detect(image_path: Path, vocabulary, threshold: float = 0.15):
         union = a["w"] * a["h"] + b["w"] * b["h"] - inter
         return inter / union if union > 0 else 0.0
 
+    # Cap PER LABEL before capping overall. A flat "best 12 by score" looks
+    # reasonable and silently deletes whole object classes: on a photo of a tool
+    # set, GroundingDINO returned 330 boxes — 35 scissors, 41 saws, and 36
+    # hammers — and score-ranking alone kept five scissors and no hammer at all,
+    # so the planner was asked to drive a nail with no hammer on the table. It
+    # improvised a wrench, which then read as a planner defect and was mine.
+    per_label: dict = {}
     found.sort(key=lambda d: -d["score"])
-    kept = []
     for cand in found:
-        if any(iou(cand, k) > 0.6 for k in kept):
+        bucket = per_label.setdefault(cand["label"], [])
+        if len(bucket) >= MAX_PER_LABEL:
+            continue
+        if any(iou(cand, k) > 0.5 for k in bucket):
+            continue
+        bucket.append(cand)
+
+    kept: list = []
+    for cand in sorted(
+        (c for bucket in per_label.values() for c in bucket),
+        key=lambda d: -d["score"],
+    ):
+        if any(iou(cand, k) > 0.5 for k in kept):
             continue
         kept.append(cand)
-    return kept[:12], (h, w)
+        if len(kept) >= MAX_DETECTIONS:
+            break
+    return kept, (h, w)
 
 
 def scene_table(detections, shape) -> str:
@@ -147,7 +178,7 @@ def scene_table(detections, shape) -> str:
     return "\n".join(rows)
 
 
-async def probe(photos, goals, out_path: Path | None):
+async def probe(photos, goals, out_path=None, json_path=None):
     import cv2
     from agents.llm import get_shared_llm
     from agents.observer import encode_image
@@ -165,7 +196,21 @@ async def probe(photos, goals, out_path: Path | None):
 
         b64 = encode_image(str(photo))
         for goal, expected in goals:
-            choice = await planner.select_target(goal, table, b64)
+            # One provider timeout must not discard every result before it.
+            # It did: a single 120 s timeout on the 7th of 20 calls took the
+            # whole probe down and left nothing on disk, so the six answers
+            # already paid for were lost along with the failure.
+            try:
+                choice = await planner.select_target(goal, table, b64)
+            except Exception as exc:  # noqa: BLE001 - provider SDKs raise broadly
+                print(f"  {goal!r}\n      !! {type(exc).__name__}: {exc}", flush=True)
+                results.append({
+                    "photo": photo.name, "goal": goal, "expected": expected,
+                    "detected": labels, "interpretation": "", "confidence": "",
+                    "ranked": [], "error": str(exc),
+                })
+                _dump(results, out_path, json_path)
+                continue
             ranked = [
                 {
                     "id": c.object_id,
@@ -188,11 +233,21 @@ async def probe(photos, goals, out_path: Path | None):
                 f"{r['label']}(p{r['priority']})" for r in ranked
             ) or "(nothing)"
             print(f"  {goal!r}\n      -> {top}\n      expected: {expected}", flush=True)
+            # Written after every answer, so an interrupted probe still leaves
+            # everything it managed to measure.
+            _dump(results, out_path, json_path)
 
+    _dump(results, out_path, json_path)
     if out_path:
-        out_path.write_text(render(results))
         print(f"\nwrote {out_path}")
     return results
+
+
+def _dump(results, out_path, json_path) -> None:
+    if out_path:
+        Path(out_path).write_text(render(results))
+    if json_path:
+        Path(json_path).write_text(json.dumps(results, indent=2))
 
 
 def render(results) -> str:
@@ -218,7 +273,9 @@ def render(results) -> str:
                 "|---|---|---|---|---|---|"]
         for r in rows:
             if not r["ranked"]:
-                out.append(f"| `{r['goal']}` | — | — | (nothing returned) | {r['expected']} | |")
+                why = (f"**call failed:** {r['error']}" if r.get("error")
+                       else "_declined — nothing here serves the goal_")
+                out.append(f"| `{r['goal']}` | — | — | {why} | {r['expected']} | |")
                 continue
             for j, c in enumerate(r["ranked"]):
                 goal_cell = f"`{r['goal']}`" if j == 0 else ""
@@ -251,11 +308,11 @@ def main(argv=None) -> int:
     if not photos:
         raise SystemExit(f"no images in {args.photos}")
 
-    results = asyncio.run(
-        probe(photos, GOALS, Path(args.report) if args.report else None)
-    )
-    if args.json:
-        Path(args.json).write_text(json.dumps(results, indent=2))
+    asyncio.run(probe(
+        photos, GOALS,
+        Path(args.report) if args.report else None,
+        Path(args.json) if args.json else None,
+    ))
     return 0
 
 

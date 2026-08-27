@@ -395,18 +395,26 @@ request names one object and only one object could be meant, a single candidate
 at priority 1 is the right answer.
 
 --- AN EMPTY LIST IS A REAL ANSWER ---
-If nothing on the table serves the request, return **no candidates at all**. Say
-so in "interpretation". That is a correct, useful answer and the run will stop
-cleanly.
+If nothing on the table serves the request, return **no candidates at all** and
+say so in "interpretation". That is a correct, useful answer and the run stops
+cleanly. Never pick the closest available thing just to have picked something: a
+robot sent to fetch it will bring it back and be wrong, confidently, and nothing
+downstream can notice — every later step treats the choice as already settled.
 
-Do not improvise. A spoon is not a hammer, a plate is not food, and a robot sent
-to fetch one will bring it back and be wrong — confidently, and with nothing
-downstream able to notice, because every later step treats the choice of object
-as already settled. The question is not "what is the closest thing here?" but
-"is what they asked for here at all?".
+The test is one question: **would the person, handed this object, consider their
+request answered?**
 
-An object only counts if it genuinely does the job. Something merely associated
-with the task does not: a plate is where food goes, not something to eat.
+- **Yes — include it.** Everyday alternatives count and are not improvisation. A
+  bottle or a mug both answer "something to drink from". A saw and a knife both
+  answer "something to cut". Give the better fit priority 1 and the workable one
+  a 1 as well if either would genuinely do, or a 2 if one is clearly better.
+- **No — leave it out.** Being *associated* with the task is not the same as
+  doing it. A plate is where food goes, not food. A spoon is not a hammer. A box
+  might contain something edible, but nobody asked for a box.
+
+So the question is not "what is closest?" and not "is this the textbook example?"
+— it is "does this actually do the job?" Both mistakes are real: fetching a spoon
+to hammer with, and refusing a perfectly good bottle because it is not a glass.
 
 Set "confidence" to "low" when the request is vague enough that a reasonable
 person might have meant something else. It does not stop the run; it is recorded

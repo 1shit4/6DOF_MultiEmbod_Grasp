@@ -600,6 +600,70 @@ scenario whose docstring claimed obstruction that measurement showed did not exi
 
 ---
 
+### 7.13 Priority against effort, and what real photographs showed
+
+**Stage 1 sets a priority; stage 2 spends it.** `priority` is 1 for the best
+answer, and **ties are meaningful** — equal priority says either object serves
+equally well, which is what licenses taking whichever is cheaper. Stage 1 is
+deliberately *not* shown what is in the way; Python measures blockers per
+candidate, then stage 2 sees both and emits `target_order`. Priority leads;
+within a tier effort decides freely; across tiers a swap needs a large gap and is
+recorded in `run_notes`. Python validates the order is a permutation of the real
+candidates, so the unguarded swap removed in §7.12 cannot return.
+
+Verified live, both directions:
+
+| run | stage 1 | outcome |
+|---|---|---|
+| `c3_tie_effort` (`affordance_choice`) | knife **p1** (1 blocker), scissors **p1** (0) | took the scissors — **1 iteration, nothing moved** |
+| `c3_priority_holds` (`affordance_table`) | knife **p1** alone (1 blocker) | kept the knife, cleared the bottle — 2 iterations |
+
+Its words: *"Both are priority 1... the scissors are not blocked, so they require
+zero effort, whereas the knife is partially occluded."* Effort saves work where
+suitability ties, and never buys a cheaper wrong answer.
+
+**Three fixes this needed.** A declined retarget acted on nothing *and* recorded
+no evaluation, so `iterations_without_progress` counted it — **a refusal supplied
+the evidence justifying the next request**, and one real failure plus one
+declined ask cleared a bar meant to need two. Non-acting actions are now skipped
+by the counter, and a decline falls back to the geometric choice and does real
+work. Separately, `set_grand_plan` takes three fields and a model emitted a
+fourth (`target_id`), killing the run with a `TypeError` from inside the state
+writer that named neither the model nor the key; the plan is now filtered.
+
+#### Real photographs: `scripts/probe_target_selection.py`
+
+Synthetic scenarios hand the planner the **literal label the scene author typed**,
+so they test reading an abstract goal and **not** coping when perception is
+wrong. This probe runs stage 1 alone against GroundingDINO on five real photos:
+**20/20 correct** (`outputs/reports/target_selection_real_photos.md`).
+
+The result worth the exercise: it **declined "something to drink from" on a
+workbench whose table listed a `bottle`**, because the image showed a
+screwdriver. It overrode a wrong label using the photograph.
+
+* **The defect found.** It *improvised* when nothing served — a spoon for a nail,
+  a plate when hungry. Telling it an empty candidate list is a correct answer
+  fixed all four cases and held. The first wording over-corrected (it then
+  refused a real bottle for not being a glass), so the prompt now poses one
+  question — *would the person, handed this object, consider their request
+  answered?* — with examples on both sides. Both errors are real and opposed.
+* **Detection is the weaker half.** Real objects score 0.39-0.93, hallucinations
+  0.15-0.30; at 0.15 an "apple" on a photo of a tool set out-competed a real
+  hammer, and on 30 dense tools (330 boxes) the hammer was ranked out of the
+  table entirely.
+* **Three "planner failures" were measurement failures** — scoring `box` as
+  not-food when it was a **Cheez-It box**, calling a correct decline a
+  regression, and a `kept[:12]` cap in the probe that deleted a whole detected
+  class. All from reading labels instead of opening the images: the exact failure
+  the probe exists to catch. **When a target choice looks wrong, open the photo
+  before blaming the model.**
+
+**A label is not an object.** Everything after stage 1 works on an instance id
+and treats suitability as settled, so a confident wrong label propagates
+unchecked. The planner caught one. That is not a guarantee, and it is the open
+risk in this design.
+
 ### 7.12 An abstract goal, and the target as an inference
 
 `--target` was a label matched by substring, so the human had already done the
@@ -815,13 +879,27 @@ are needed"* → retarget **allowed** at iteration 2 and recorded with the model
 grasp the scissors. 19 vs 18 calls on the same scenario is the **+1 request** the two-stage
 design predicted.
 
-**718 offline tests** (112 new), **75/75** verification checks. `AsyncRateLimiter` was
+**Change 3 — priority against effort, and change 4 — real photographs.** Stage 1 now
+sets a suitability `priority` (ties meaningful); Python measures blockers; stage 2
+orders on both (§7.13). Verified live in both directions: a tie went to the free
+object in **1 iteration with nothing moved**, and a lone priority-1 target kept its
+place and paid an iteration to clear its blocker.
+
+`scripts/probe_target_selection.py` tests stage 1 alone against GroundingDINO on five
+real photographs: **20/20 correct**. It found the planner *improvising* when nothing
+served (a spoon for a nail, a plate when hungry) — fixed by saying an empty list is a
+correct answer — and demonstrated the opposite capability by **declining a `bottle`
+that the image showed to be a screwdriver**.
+
+**730 offline tests** (132 new), **75/75** verification checks. `AsyncRateLimiter` was
 deleted — nothing paced through it once the pool existed, and a tested-but-unused pacer
 reads as live.
 
-**The lesson both changes taught, in one sentence.** Every defect in §7.12 was found by
-reading *why* a run did what it did, and none of them was visible in its exit status: the
-runs that concealed the worst one both reported `SUCCESS` and both grasped a cutting tool.
+**The lesson all four changes taught.** Every defect here was found by reading *why* a
+run did what it did; none was visible in an exit status. The runs concealing the worst
+one both reported `SUCCESS` and both grasped a cutting tool. And three "planner
+failures" were failures of *measurement* — read from detector labels rather than the
+photographs — so when a choice looks wrong, open the image before blaming the model.
 
 
 ### 2026-08-20 — session 4: the loop with a live LLM driving it
@@ -1103,16 +1181,22 @@ Built the whole loop, M1 through M7. **549 tests pass** (331 new, all offline, ~
 ## 9. Handoff — what needs the user
 
 Everything that can be verified without credentials or extra datasets **has been**:
-**584 offline tests**, `scripts/verify_pipeline.py` end-to-end on real RGB-D, and
+**730 offline tests**, `scripts/verify_pipeline.py` end-to-end on real RGB-D, and
 `scripts/verify_declutter.py` running the whole long-horizon loop against ground truth
 (75/75 checks).
 
-**The agent loop is no longer blocked.** The key works, and the decluttering loop has run
-end to end with Gemini driving it — as of 2026-08-23, six runs plus a no-LLM control
-under `outputs/runs/20260823T1*`, **all seven reaching the target**, each recovering from
-a different injected execution fault (§8, session 6). Narratives at
-`outputs/reports/index.md`. **One thing remains**, and it is blocked on a dataset only
-the user can supply.
+**The agent loop is no longer blocked.** The key pool works and the loop has run end to
+end with Gemini driving it: the injected-failure matrix (§8, sessions 6-7), abstract
+goals with no `--target`, and a live retarget. Narratives at
+`outputs/reports/index.md`; stage-1 target selection on real photographs at
+`outputs/reports/target_selection_real_photos.md`.
+
+**Two open risks, neither a bug.** *A label is not an object* — suitability is decided
+once from detector labels and validated only for existence, so a confident wrong label
+propagates unchecked (§7.13, SUMMARY §8.1). And execution is scene mutation, not
+physics, so the evaluator has only met failures somebody thought of (§7.9).
+
+**One thing remains**, and it is blocked on a dataset only the user can supply.
 
 ### 1. Running it yourself
 

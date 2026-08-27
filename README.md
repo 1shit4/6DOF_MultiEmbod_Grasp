@@ -25,7 +25,7 @@ rectangles. Runs entirely on **CPU** and on a **free LLM tier**.
 ```bash
 bash scripts/setup.sh          # envs, repos, CPU patch, ~10 GB of assets
 scripts/run_server.sh --daemon # GraspGen-X server, loads the model once
-scripts/run_tests.sh           # 606 offline tests: no GPU, no network, no LLM spend
+scripts/run_tests.sh           # 730 offline tests: no GPU, no network, no LLM spend
 ```
 
 Then, with no API key needed (grounding runs on local weights):
@@ -80,6 +80,10 @@ cd GraspMAS && python main_declutter.py --goal "pick up the banana" --target ban
 
 # With Gemini choosing what to move next (needs a key; ~16 requests)
 cd GraspMAS && python main_declutter.py --goal "pick up the banana" --target banana -v
+
+# Omit --target and the task planner works out what the goal means (+1 request)
+cd GraspMAS && python main_declutter.py --goal "i need something to cut" \
+    --scenario affordance_choice
 ```
 
 Verified both ways: 75/75 geometric checks, and seven LLM-driven runs on 2026-08-23 —
@@ -93,6 +97,20 @@ re-rendered, with failures injected explicitly
 (`--inject drop,offset,collateral,wrong_object`). See
 [`docs/declutter.md`](docs/declutter.md), and `scripts/summarize_run.py` to digest
 a finished run.
+
+**Target selection is tested separately on real photographs**, because every
+synthetic scenario hands the planner the label its author typed and so cannot test
+what happens when perception is wrong:
+
+```bash
+conda run -n graspmas python scripts/probe_target_selection.py \
+    --photos outputs/reports/probe_photos --report /tmp/probe.md
+```
+
+20/20 correct on five photos — including declining "something to drink from" on a
+workbench whose detector table said `bottle`, because the image showed a
+screwdriver. Results and the standing risk (*a label is not an object*) in
+[`outputs/reports/target_selection_real_photos.md`](outputs/reports/target_selection_real_photos.md).
 
 ## What changed from upstream GraspMAS
 

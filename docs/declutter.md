@@ -43,9 +43,15 @@ One iteration, in order:
 4. iteration cap → `failed`
 
 `retarget` and `defer` are not terminal. A `defer` is a decision declined on
-*timing* rather than possibility: nothing is acted on, the correction reaches the
-next decision, and the run continues. It stays bounded because a deferred
-iteration records no progress, so stall detection counts it.
+*timing* rather than possibility — a retarget asked for too early. The iteration
+falls back to the geometric choice and does **real work**, carrying the refusal
+into the next decision.
+
+Deferred and retarget iterations are skipped by `iterations_without_progress()`,
+which both stall detection and the retarget gate read. That matters: counting a
+declined iteration let **a refusal supply the very evidence justifying the next
+request**, so one real failure plus one declined ask cleared a bar meant to need
+two failures.
 
 Progress means *the target stopped being blocked*, not *the action succeeded* —
 those come apart in both directions, which is the whole point of the evaluator
@@ -99,12 +105,30 @@ python main_declutter.py --goal "i need something to cut" \
 ```
 
 **Choosing the target.** With `--target` the label is matched against detections
-exactly as before and nothing else changes. Without it, a stage-1 call returns a
-*ranked* list of candidate instance ids, Python drops any that are missing or too
-sparse, and the top one becomes the target; the blocking analysis for the top 3
-is then shown to the grand-plan call so the removal order is written knowing what
-else was in the running. Cost: **one extra request per run**. `--no-llm` requires
-`--target`, because nothing offline can read a goal like "something to cut".
+exactly as before and nothing else changes. Without it:
+
+1. **Stage 1** returns candidates with a `priority` — 1 is best, and **ties are
+   meaningful**: equal priority means either object serves equally well. It sees
+   the scene and the photo but *not* what is in the way, so suitability is judged
+   on its own.
+2. **Python** drops candidates that are missing or too sparse, then measures
+   blockers for the top 3.
+3. **Stage 2** (the grand plan) sees priority and cost together and returns
+   `target_order`. Priority leads; within a tier effort decides; across tiers a
+   swap needs a large gap and is recorded in `run_notes`. Python validates the
+   order is a permutation of the real candidates — it can reorder, never invent.
+
+Cost: **one extra request per run**. `--no-llm` requires `--target`, because
+nothing offline can read a goal like "something to cut".
+
+> **Risk: a label is not an object.** Suitability is decided once, from detector
+> labels, and validated only for *existence* — never for sensibleness. Everything
+> downstream works on an instance id and treats the choice as settled, so a
+> confident wrong label propagates unchecked. Measured on real photographs
+> (`outputs/reports/target_selection_real_photos.md`): 20/20 correct, and it did
+> reject a "bottle" the image showed to be a screwdriver — a capability observed,
+> not a guarantee. Synthetic scenarios cannot test it at all, because they hand
+> the planner ground-truth labels.
 
 **Changing the target.** The goal is the person's words and never changes. The
 target is the system's *inference* about them, so it may be revised — through the
