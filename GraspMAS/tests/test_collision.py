@@ -321,3 +321,39 @@ class TestDeclutteringActuallyHelps:
         r = ss.render(cleared, K, T)
         after = col.scene_cloud_excluding(r["depth"], K, exclude_mask=(r["seg"] == label))
         assert col.sweep_is_clear(grasp, after, gripper_pts, approach_len=0.12)
+
+
+class TestGripperConfig:
+    """One reader for `config.json`, because three subsystems needed it.
+
+    The overlay used to hardcode 0.11 m for every gripper's fingertip depth
+    while the mask filter read the real number out of the same file. 0.11 is not
+    even the Franka's value (0.1034), and the Observer is told to check that the
+    object sits between the fingertips it draws.
+    """
+
+    @needs_assets
+    def test_fingertip_depth_differs_per_gripper(self):
+        panda = col.gripper_geometry("franka_panda")[1]
+        robotiq = col.gripper_geometry("robotiq_2f_85")[1]
+        assert panda == pytest.approx(0.1034, abs=1e-3)
+        assert robotiq == pytest.approx(0.136, abs=1e-3)
+        # The bug was one constant standing in for all of them.
+        assert abs(panda - robotiq) > 0.03
+
+    @needs_assets
+    def test_geometry_matches_the_config_file(self):
+        cfg = col.gripper_config("franka_panda")
+        width, depth = col.gripper_geometry("franka_panda")
+        assert width == pytest.approx(cfg["sweep_volume"]["extents"][0])
+        assert depth == pytest.approx(cfg["fingertip"][-1])
+
+    @needs_assets
+    def test_morphology_is_available(self):
+        """What the Observer needs to judge a hand it cannot otherwise identify."""
+        assert col.gripper_config("franka_panda")["type"] == "parallel_2f"
+        assert col.gripper_config("barrett_hand")["type"] == "revolute_3f"
+
+    def test_unknown_gripper_falls_back_without_raising(self):
+        assert col.gripper_config("no_such_gripper") == {}
+        assert col.gripper_geometry("no_such_gripper") == (0.08, 0.11)

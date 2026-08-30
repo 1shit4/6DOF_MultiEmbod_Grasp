@@ -612,3 +612,57 @@ class TestPlacePose:
             pl.plan_place(grasp, obj, tabletop_cloud, plane, keep_out=blocked, hmap=hmap)
             is None
         )
+
+
+class TestGripperDerivedClearance:
+    """Leave room for the hand to come back — but never at the cost of a deadlock.
+
+    A fixed 3 cm margin corrects the footprint bias and says nothing about the
+    hand, so an object could be set down where the gripper could not reach it
+    afterwards. How much room that needs is a property of the gripper: 10.4 cm
+    for a Robotiq, 19.6 cm for a Barrett.
+
+    But as a hard requirement it is unusable — 59 tests failed with "no
+    placement available" on a table that had been solvable for months. So it is
+    a preference: ask for gripper clearance, settle for the safe minimum. If the
+    tighter spot does foul a later grasp, the collision filter names the object
+    and the loop moves it again — one iteration, not a deadlock.
+    """
+
+    def test_it_scales_with_the_gripper(self):
+        panda = pl.gripper_clearance_m("franka_panda")
+        barrett = pl.gripper_clearance_m("barrett_hand")
+        assert barrett > panda > pl.DEFAULT_MARGIN_M
+        assert barrett == pytest.approx(0.196, abs=0.01)
+
+    def test_it_never_goes_below_the_footprint_bias_correction(self):
+        """The 3 cm exists to absorb a measured 1.7 cm bias; it is a floor."""
+        for g in ("franka_panda", "robotiq_2f_85", "no_such_gripper"):
+            assert pl.gripper_clearance_m(g) >= pl.DEFAULT_MARGIN_M
+
+    def test_missing_assets_fall_back_quietly(self):
+        assert pl.gripper_clearance_m("no_such_gripper") >= pl.DEFAULT_MARGIN_M
+
+    def test_it_exceeds_the_contact_threshold(self):
+        """Otherwise the loop places an object and re-flags it as touching."""
+        import scene_registry as sr_
+
+        for g in ("franka_panda", "robotiq_2f_85", "barrett_hand"):
+            assert pl.gripper_clearance_m(g) > sr_.TOUCH_MARGIN_M
+        assert pl.DEFAULT_MARGIN_M > sr_.TOUCH_MARGIN_M
+
+    def test_a_crowded_scene_still_gets_a_placement(self, tabletop):
+        """The deadlock this fallback exists to prevent."""
+        import scene_registry as sr_
+
+        reg = sr_.SceneRegistry()
+        reg.update_from_segmentation(
+            tabletop["depth"], tabletop["K"], tabletop["seg"], 0, tabletop["label_map"]
+        )
+        inst = next(i for i in reg.instances.values() if i.label == "bottle")
+        pose = reg.nominal_grasp(inst.id)
+        place = pl.plan_place(
+            pose, inst.cloud, reg.scene_cloud_excluding(), reg.plane,
+            gripper="franka_panda", hmap=reg.hmap,
+        )
+        assert place is not None, "the fallback margin should always find somewhere"

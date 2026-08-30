@@ -19,15 +19,20 @@ class ImagePatch:
     cropped_image : array_like
         An array-like of the cropped image taken from the original image.
     left : int
-        An int describing the position of the left border of the crop's bounding box in the original image. Higher values are closer to the left.
+        An int describing the position of the left border of the crop's bounding box in the original image. Higher values are closer to the right.
     lower : int
-        An int describing the position of the bottom border of the crop's bounding box in the original image. Higher values are closer to the bottom.
+        An int describing the position of the bottom border of the crop's bounding box in the original image.
+        Measured from the BOTTOM of the image, so higher values are closer to the top.
     right : int
         An int describing the position of the right border of the crop's bounding box in the original image. Higher values are closer to the right.
     upper : int
-        An int describing the position of the top border of the crop's bounding box in the original image. Higher values are closer to the top.
+        An int describing the position of the top border of the crop's bounding box in the original image.
+        Measured from the BOTTOM of the image, so higher values are closer to the top.
     vertical_center: int
-        An int describing the vertical center of the crop's bounding box in the original image. Higher values are closer to the top.
+        An int describing the vertical center of the crop's bounding box in the original image.
+        Measured from the BOTTOM of the image: higher values are closer to the top. This is NOT an
+        image row index. So the HIGHEST object in the picture is sorted(..., key=lambda p: p.vertical_center)[-1]
+        and the LOWEST is [0].
     horizontal_center: int
         An int describing the horizontal center of the crop's bounding box in the original image. Higher values are closer to the right.
     mask : array_like
@@ -59,6 +64,15 @@ class ImagePatch:
         Return the best 6-DoF grasp pose for the given object_patch (which carries the mask of the
         object or object part). Returns a dict with 3D position in metres, approach and closing
         direction vectors, a confidence score, and the gripper jaw width. Returns None on failure.
+        The dict ALSO carries "candidates": every other grasp that survived the same filters,
+        best first, each with "index", "score", "position", "approach" and "closing". There are
+        typically 15-60 of them and the runners-up score within a few hundredths of the winner.
+    select_grasp(grasp: dict, candidates: list)->dict
+        Pick a different grasp from the ones already found. Filter grasp["candidates"] however the
+        situation calls for, pass what remains, and the best of them comes back as a full grasp.
+        Costs nothing — no new detection, no grasp server. Returns None if the list is empty.
+        Use this when a grasp has to CHANGE: re-running grasp_detection on the same object returns
+        the same pose, because it is the same computation on the same mask.
     find_by_id(object_id: str)->ImagePatch
         Return the object with a given stable instance id, e.g. "obj_003". Use this instead of
         find() whenever the plan names an id: find() cannot tell two identical objects apart.
@@ -612,7 +626,7 @@ def execute_command(image):
 ### Example 5
 Plan: 
 Step 1: Detect all knives in the image.
-Step 2: To handover to the user safely, locate the "blade" part of the first detected knife.
+Step 2: The knife is to be handed to the person, so the robot must hold the "blade" and present the handle. Locate the "blade" part of the first detected knife.
 Step 3: Calculate the grasp pose for the knife blade.
 A: ```
 def execute_command(image):
@@ -622,6 +636,38 @@ def execute_command(image):
     knife_blade_patch = knife_patch.find_part("knife", "blade")
     grasp_pose = image_patch.grasp_detection(knife_blade_patch)
     return grasp_pose
+    ```
+
+### Example 5b
+Plan: 
+Step 1: Find obj_004 in the image.
+Step 2: obj_004 is a knife being moved out of the way, not handed over, so take the most secure hold. Locate its "handle" part.
+Step 3: Calculate the 6-DoF grasp pose for the handle of obj_004.
+A: ```
+def execute_command(image):
+    image_patch = ImagePatch(image)
+    obj_004 = image_patch.find_by_id("obj_004")
+    handle_patch = obj_004.find_part("knife", "handle")
+    grasp_pose = image_patch.grasp_detection(handle_patch)
+    return grasp_pose
+    ```
+
+### Example 5c
+Plan: 
+Step 1: Find obj_002 in the image.
+Step 2: Compute the grasp pose for obj_002.
+Step 3: The previous attempt was rejected because the hand approached through the object beside it, which lies to the +X side. Choose a grasp that approaches from a different direction instead.
+A: ```
+def execute_command(image):
+    image_patch = ImagePatch(image)
+    obj_002 = image_patch.find_by_id("obj_002")
+    grasp_pose = image_patch.grasp_detection(obj_002)
+    if grasp_pose is None:
+        return None
+    # Keep only the alternatives that do not come in from the +X side.
+    alternatives = [c for c in grasp_pose["candidates"] if c["approach"][0] < 0.2]
+    better = image_patch.select_grasp(grasp_pose, alternatives)
+    return better if better is not None else grasp_pose
     ```
 
 ### Example 6

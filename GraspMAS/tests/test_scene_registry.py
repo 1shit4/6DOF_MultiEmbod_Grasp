@@ -243,10 +243,6 @@ class TestBlocking:
         }
         assert all("occlusion" in b.reasons for b in blockers)
 
-    def test_skips_geometry_it_cannot_trust(self, registry, target_id):
-        """A footprint fitted to a fragment would give confident nonsense."""
-        assert all(b.sweep_points == 0 for b in registry.blocking_objects(target_id))
-
     def test_the_distractor_never_blocks(self, registry, target_id):
         blockers = registry.blocking_objects(target_id)
         box_id = next(i.id for i in registry.instances.values() if i.label == "box")
@@ -261,45 +257,10 @@ class TestBlocking:
         assert not banana.footprint_is_reliable, "the mug still cuts the banana off"
         assert mug_id in {b.object_id for b in reg.blocking_objects(banana.id)}
 
-    def test_geometry_catches_a_blocker_that_occludes_nothing(self):
-        """The case a purely visual notion of 'in the way' would miss entirely.
-
-        An object *behind* the target hides none of it, but a parallel jaw spans
-        the target's short axis — toward and away from the camera — so it is
-        squarely inside the hand. The target is fully visible here, so the
-        footprint is trustworthy and the geometric tests are the ones that fire.
-        """
-        spec = ss.add_objects([
-            ("banana", ss.Primitive("box", (0.16, 0.045, 0.04), (0.0, 0.0, 0.0))),
-            ("behind", ss.Primitive("cylinder", (0.04, 0.04, 0.09), (0.0, 0.10, 0.0))),
-        ])
-        K, T = ss.default_intrinsics(), ss.default_camera()
-        out = ss.render(spec, K, T)
-        reg = sr.SceneRegistry()
-        reg.update_from_segmentation(out["depth"], K, out["seg"], 0, spec.label_map())
-
-        banana = next(i for i in reg.instances.values() if i.label == "banana")
-        behind = next(i for i in reg.instances.values() if i.label == "behind")
-        assert banana.footprint_is_reliable
-        assert reg.occlusion_of(banana.id).get(behind.id, 0.0) == 0.0
-
-        blockers = {b.object_id: b for b in reg.blocking_objects(banana.id)}
-        assert behind.id in blockers, "an object inside the jaw must be a blocker"
-        b = blockers[behind.id]
-        assert "occlusion" not in b.reasons
-        assert {"approach", "proximity"} & set(b.reasons)
-
     def test_no_blockers_once_the_table_is_clear(self, tabletop):
         reg = _registry(_render(tabletop["spec"], tabletop, {"banana", "box"}), 0)
         banana = next(i for i in reg.instances.values() if i.label == "banana")
         assert reg.blocking_objects(banana.id) == []
-
-    def test_an_explicit_grasp_pose_enables_geometry(self, registry, target_id):
-        """Supplying a real grasp overrides the visibility gate."""
-        pose = np.eye(4)
-        pose[:3, 3] = registry.get(target_id).centroid_cam
-        blockers = registry.blocking_objects(target_id, grasp_pose=pose)
-        assert isinstance(blockers, list)
 
     def test_severity_orders_the_worst_first(self, tabletop):
         reg = _registry(_render(tabletop["spec"], tabletop, {"banana", "mug", "box"}), 0)
@@ -474,3 +435,164 @@ class TestResolveTarget:
             if inst.label.startswith("bottle"):
                 inst.label = "bottle"
         assert reg.resolve_target("bottle") is not None
+
+
+class TestCollisionAttribution:
+    """Which object is in the way, not merely that something is.
+
+    `scene_cloud_excluding` flattens the scene into an anonymous point array, so
+    the collision filter knew a grasp was fouled and could never say by what.
+    That is the difference between "no grasp found for obj_002" — which the
+    planner cannot act on — and "obj_003 is in the way of obj_002", which names
+    the thing to move.
+
+    Note what this measures: proximity to the hand's *surface*. A grasp
+    deliberately does not touch the object it holds — a Panda's open jaw clears
+    the banana by 2.4 cm — so an object being grasped correctly registers
+    nothing. That is the behaviour that makes this a collision test rather than
+    a containment test.
+    """
+
+    @staticmethod
+    def _hand_at(inst):
+        """A hand driven onto `inst`, i.e. a definite collision with it."""
+        pose = np.eye(4)
+        pose[:3, 3] = inst.centroid_cam
+        return pose
+
+    def test_it_names_the_obstructing_objects_worst_first(self, registry):
+        """The mug's neighbourhood contains all three small objects."""
+        mug = next(i for i in registry.instances.values() if i.label == "mug")
+        named = registry.colliding_instances(
+            self._hand_at(mug), approach_len=0.0
+        )
+        labels = [label for _, label, _ in named]
+        assert labels[0] == "mug", named
+        assert {"bottle", "banana"} <= set(labels), named
+        counts = [n for _, _, n in named]
+        assert counts == sorted(counts, reverse=True)
+
+    def test_an_isolated_object_names_only_itself(self, registry):
+        """The distractor box stands alone, and the measure has to show that.
+
+        If everything named everything, attribution would be worthless — the
+        planner would be told to move the whole table.
+        """
+        box = next(i for i in registry.instances.values() if i.label == "box")
+        named = registry.colliding_instances(
+            self._hand_at(box), approach_len=0.0
+        )
+        assert [label for _, label, _ in named] == ["box"], named
+
+    def test_exclude_drops_the_object_being_grasped(self, registry):
+        bottle = next(i for i in registry.instances.values() if i.label == "bottle")
+        pose = self._hand_at(bottle)
+        with_it = registry.colliding_instances(pose, approach_len=0.0)
+        without = registry.colliding_instances(
+            pose, exclude=(bottle.id,), approach_len=0.0
+        )
+        assert bottle.id in [oid for oid, _, _ in with_it]
+        assert bottle.id not in [oid for oid, _, _ in without]
+        # And the neighbour it actually fouls survives the exclusion.
+        assert without, "excluding the grasped object hid the real obstruction"
+
+    def test_a_clear_pose_names_nobody(self, registry):
+        """No attribution means the failure was not an obstruction.
+
+        This is the gate that stops the object-B cascade firing on failures
+        nothing can be moved to fix — a jaw too small for the object, or a
+        grasp that keeps slipping. Neither produces an attribution.
+        """
+        pose = np.eye(4)
+        pose[:3, 3] = [5.0, 5.0, 5.0]  # nowhere near the table
+        assert registry.colliding_instances(pose) == []
+
+
+class TestReachableGrasp:
+    """Ask the question the run exists to answer, instead of inferring it."""
+
+    def test_a_clear_target_reports_a_grasp(self, tabletop):
+        reg = _registry(_render(tabletop["spec"], tabletop, {"banana", "box"}), 0)
+        banana = next(i for i in reg.instances.values() if i.label == "banana")
+        assert reg.reachable_grasp(banana.id) is not None
+
+    def test_it_is_a_lower_bound_not_a_verdict(self, registry, target_id):
+        """One synthesised pose against the real cloud; the sampler tries 416.
+
+        So None means "the obvious grasp is fouled", never "the target is
+        unreachable" — which is the right way round, because the result is only
+        ever used to talk the loop INTO trying a grasp, never out of clearing.
+        """
+        got = registry.reachable_grasp(target_id)
+        assert got is None or got.shape == (4, 4)
+
+    def test_an_unknown_object_does_not_raise(self, registry):
+        import pytest as _pytest
+
+        with _pytest.raises(KeyError):
+            registry.reachable_grasp("obj_does_not_exist")
+
+
+class TestContactReplacesProximity:
+    """"In the way" now means hiding it, or touching it. Nothing else.
+
+    *approach* swept one synthesised top-down pose and fired **zero** times
+    across every recorded run. *proximity* flagged anything within half the
+    width of the whole hand, on the assumption the hand must come in broadside.
+    Both were deleted rather than tuned. What is left are two things whose
+    removal demonstrably helps: an occluder buys perception, and something
+    touching the target may resist the pick or topple when it is lifted away.
+    """
+
+    @staticmethod
+    def _two(gap_y):
+        spec = ss.add_objects([
+            ("banana", ss.Primitive("box", (0.16, 0.045, 0.04), (0.0, 0.0, 0.0))),
+            ("behind", ss.Primitive("cylinder", (0.04, 0.04, 0.09), (0.0, gap_y, 0.0))),
+        ])
+        K, T = ss.default_intrinsics(), ss.default_camera()
+        out = ss.render(spec, K, T)
+        reg = sr.SceneRegistry()
+        reg.update_from_segmentation(out["depth"], K, out["seg"], 0, spec.label_map())
+        banana = next(i for i in reg.instances.values() if i.label == "banana")
+        behind = next(i for i in reg.instances.values() if i.label == "behind")
+        return reg, banana, behind
+
+    def test_a_separated_object_is_not_flagged(self):
+        """Occludes nothing, touches nothing — so nothing to gain by moving it.
+
+        The old approach test flagged exactly this case. Whether it actually
+        blocks a grasp is now settled by the grasp search, which tries every
+        direction rather than assuming top-down.
+        """
+        reg, banana, behind = self._two(0.10)
+        assert reg.occlusion_of(banana.id).get(behind.id, 0.0) == 0.0
+        assert behind.id not in {b.object_id for b in reg.blocking_objects(banana.id)}
+
+    def test_a_touching_object_is_flagged(self):
+        reg, banana, behind = self._two(0.065)
+        bl = {b.object_id: b for b in reg.blocking_objects(banana.id)}
+        assert behind.id in bl
+        assert bl[behind.id].reasons == ["contact"]
+
+    def test_the_gap_is_measured_between_surfaces_not_radii(self):
+        """Circumscribed radii make a 16 cm banana a circle of radius 8 cm.
+
+        By that measure a cylinder 3.75 cm away scores a gap of -3.5 cm —
+        apparently interpenetrating — which is the same over-flagging the
+        proximity test was deleted for.
+        """
+        reg, banana, behind = self._two(0.10)
+        got = sr.SceneRegistry._surface_gap(banana, behind)
+        assert got is not None and got > 0.0, got
+
+    def test_no_deleted_reasons_can_come_back(self):
+        reg, banana, _ = self._two(0.065)
+        for b in reg.blocking_objects(banana.id):
+            assert set(b.reasons) <= {"occlusion", "contact", "fouls_grasp"}
+
+    def test_occlusion_alone_decides_while_the_target_is_hidden(self, registry, target_id):
+        """The contact test needs a footprint, and a fragment has a bad one."""
+        assert not registry.get(target_id).footprint_is_reliable
+        for b in registry.blocking_objects(target_id):
+            assert b.reasons == ["occlusion"]

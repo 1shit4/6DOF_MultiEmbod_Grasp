@@ -141,3 +141,91 @@ class TestDepthColormap:
     def test_all_invalid_does_not_crash(self, tmp_path):
         path = depth_colormap(np.zeros((10, 10), np.float32), tmp_path / "d.png")
         assert path.exists()
+
+
+import collision as _col
+
+HAVE_ASSETS = _col.gripper_asset_dir("franka_panda") is not None
+needs_assets = pytest.mark.skipif(
+    not HAVE_ASSETS, reason="gripper descriptions not installed"
+)
+
+
+class TestDrawsTheRealHand:
+    """The Observer judges a grasp from this picture, so the picture must be true.
+
+    Two defects lived here at once. The fingertip line -- which the Observer is
+    explicitly told the object should sit between -- was drawn at a hardcoded
+    0.11 m for every gripper, 3.4 cm out on a Robotiq and wrong even for the
+    Franka. And the hand was a seven-point parallel-jaw sketch, shown for
+    three-finger grippers too, with the prompt calling them "the two fingers".
+    """
+
+    @staticmethod
+    def _grasp(gripper):
+        pose = np.eye(4)
+        pose[:3, 3] = [0.0, 0.0, 0.6]
+        return Grasp6D(pose=pose, score=0.9, gripper=gripper, width=0.08)
+
+    @needs_assets
+    def test_fingertip_depth_comes_from_the_gripper(self, rgb, K, tmp_path):
+        """Same pose, same jaw width, different hands -> different pictures.
+
+        Only the gripper name differs, so if the render still used one constant
+        depth and one generic wireframe these would be byte-identical.
+        """
+        import cv2
+
+        panda = visualize_grasp_6dof(
+            rgb, self._grasp("franka_panda"), K,
+            save_folder=tmp_path, filename="panda.png", draw_annotation=False,
+        )
+        robotiq = visualize_grasp_6dof(
+            rgb, self._grasp("robotiq_2f_85"), K,
+            save_folder=tmp_path, filename="robotiq.png", draw_annotation=False,
+        )
+        assert not np.array_equal(cv2.imread(str(panda)), cv2.imread(str(robotiq)))
+
+    @needs_assets
+    def test_a_three_finger_hand_is_not_drawn_as_a_two_finger_one(
+        self, rgb, K, tmp_path
+    ):
+        import cv2
+
+        two = visualize_grasp_6dof(
+            rgb, self._grasp("franka_panda"), K,
+            save_folder=tmp_path, filename="two.png", draw_annotation=False,
+        )
+        three = visualize_grasp_6dof(
+            rgb, self._grasp("barrett_hand"), K,
+            save_folder=tmp_path, filename="three.png", draw_annotation=False,
+        )
+        assert not np.array_equal(cv2.imread(str(two)), cv2.imread(str(three)))
+
+    @needs_assets
+    def test_the_silhouette_keeps_the_jaw_open(self, K):
+        """A convex hull would fill the gap the Observer is asked to read."""
+        from vis6d import _gripper_silhouette
+
+        pose = np.eye(4)
+        pose[:3, 3] = [0.0, 0.0, 0.6]
+        contours = _gripper_silhouette(pose, K, "franka_panda", (480, 640))
+        assert contours, "no outline traced for an installed gripper"
+
+        import cv2
+
+        filled = np.zeros((480, 640), np.uint8)
+        cv2.drawContours(filled, contours, -1, 255, -1)
+        hull = cv2.convexHull(np.vstack(contours))
+        hull_img = np.zeros((480, 640), np.uint8)
+        cv2.drawContours(hull_img, [hull], -1, 255, -1)
+        # The opening between the fingers is area the hull claims and the real
+        # outline does not. If they match, the gap has been drawn shut.
+        assert hull_img.sum() > filled.sum() * 1.15
+
+    def test_falls_back_when_the_gripper_is_unknown(self, rgb, K, tmp_path):
+        """No assets must still produce a picture, not an exception."""
+        path = visualize_grasp_6dof(
+            rgb, self._grasp("no_such_gripper"), K, save_folder=tmp_path
+        )
+        assert path.exists() and path.stat().st_size > 0

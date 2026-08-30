@@ -623,3 +623,218 @@ class TestRetarget:
         assert back.target_id == "obj_002"
         assert back.retargets_used == 1
         assert not back.can_retarget()
+
+
+class TestGraspDifficultyReachesThePlanner:
+    """How hard the grasp was, but only when the iteration did not work out.
+
+    The history said what was attempted and whether the object moved, and never
+    how hard the grasp was to find. So the task planner could not tell "the
+    grasp was sound and the hand slipped" from "we never found a sound grasp on
+    this thing" — which demand opposite responses, and both rendered as the
+    same blank line. Meanwhile the evidence sat unread in the same file.
+    """
+
+    @staticmethod
+    def _attempt(planned, outcome, rounds, observer=None):
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_agent_rounds(rounds)
+        planned.record_observer(observer or {})
+        planned.record_evaluation(
+            {"action_succeeded": outcome, "still_blocking_target": True}
+        )
+        planned.end_iteration()
+        return planned.planner_context()
+
+    def test_a_failed_iteration_reports_the_score(self, planned):
+        ctx = self._attempt(
+            planned, "not_moved", [{"round": 0, "grasp": {"score": 0.38}}]
+        )
+        assert "grasp 0.38" in ctx
+
+    def test_a_successful_iteration_stays_quiet(self, planned):
+        """A clean move needs no explanation, and prompt space is not free."""
+        ctx = self._attempt(
+            planned, "success", [{"round": 0, "grasp": {"score": 0.93}}]
+        )
+        assert "grasp 0.93" not in ctx
+
+    def test_a_rejected_grasp_names_the_failure_kind(self, planned):
+        ctx = self._attempt(
+            planned, "not_moved", [{"round": 0, "grasp": {"score": 0.4}}],
+            observer={"verdict": "INVALID", "failure": "geometry"},
+        )
+        assert "critic rejected it (geometry)" in ctx
+
+    def test_finding_no_grasp_at_all_is_distinguished(self, planned):
+        """The case the planner most needs to tell apart from a slip."""
+        ctx = self._attempt(planned, "not_moved", [{"round": 0, "grasp": None}])
+        assert "no grasp found" in ctx
+
+    def test_repeated_attempts_are_counted(self, planned):
+        ctx = self._attempt(planned, "not_moved", [
+            {"round": 0, "grasp": {"score": 0.2}},
+            {"round": 1, "grasp": {"score": 0.3}},
+        ])
+        # Must say whose attempts these are. Bare "2 attempts" was read by the
+        # planner as two failed *iterations* on the object — the trigger for its
+        # own two-strikes rule — and it aborted a recoverable run after one
+        # failure, citing "two failed attempts on the same object".
+        assert "within this one iteration" in ctx
+        assert "grasp 0.30" in ctx  # the best of them, not the last
+
+    def test_the_round_count_cannot_be_read_as_iterations(self, planned):
+        ctx = self._attempt(planned, "not_moved", [
+            {"round": 0, "grasp": {"score": 0.2}},
+            {"round": 1, "grasp": {"score": 0.3}},
+        ])
+        import re
+
+        for line in ctx.splitlines():
+            if "attempts" in line:
+                assert re.search(r"within this one iteration", line), line
+
+    def test_no_inner_loop_adds_no_line(self, planned):
+        """The scripted path runs no agents; it must not gain a blank claim."""
+        ctx = self._attempt(planned, "not_moved", [])
+        assert "grasp" not in ctx.split("HISTORY")[1]
+
+
+class TestCandidatesAreNotStored:
+    """The alternatives are working memory, not run history.
+
+    `grasp_detection` returns up to 20 candidates so a rejection can be answered
+    with a different pose, but they are consumed from an in-memory registry and
+    never read back from the state file — while the recorder already writes all
+    ~416 to a .npz. Storing a JSON copy costs ~3 KB per grasp, duplicated per
+    round, and buys nothing.
+    """
+
+    @staticmethod
+    def _grasp():
+        return {
+            "pose": [[1, 0, 0, 0]], "score": 0.9,
+            "candidates": [{"index": i, "score": 0.9 - i * 0.01} for i in range(20)],
+        }
+
+    def test_record_plan_drops_them(self, planned):
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_plan(self._grasp(), None)
+        stored = planned.current.planned["grasp"]
+        assert "candidates" not in stored
+        assert stored["score"] == 0.9  # everything else survives
+
+    def test_the_count_is_kept(self):
+        """How many alternatives existed is worth a line; the list is not."""
+        slim = st.SessionState._slim_grasp(self._grasp())
+        assert slim["n_candidates_available"] == 20
+
+    def test_agent_rounds_drop_them_too(self, planned):
+        """Otherwise they are duplicated once per inner round."""
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_agent_rounds([{"round": 0, "grasp": self._grasp()}])
+        assert "candidates" not in planned.current.agent_rounds[0]["grasp"]
+
+    def test_a_grasp_without_candidates_is_untouched(self, planned):
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_plan({"pose": [], "score": 0.5}, None)
+        assert planned.current.planned["grasp"] == {"pose": [], "score": 0.5}
+
+    def test_none_survives(self):
+        assert st.SessionState._slim_grasp(None) is None
+
+
+class TestPlanHistoryJoin:
+    """The plan and the history were two lists nobody joined.
+
+    `removal_order` carried no status, so "attempted twice and failed" was
+    neither done, skipped, nor pending, and the planner had to re-derive its
+    own position by cross-referencing two lists in-context on every call. That
+    join is arithmetic and belongs in Python — and it got ambiguous exactly
+    when a run went badly, which is when it mattered.
+    """
+
+    def test_a_cleared_step_is_marked_done(self, planned):
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_evaluation({"action_succeeded": "success"})
+        planned.end_iteration()
+        steps = {s["object_id"]: s for s in planned.plan_steps()}
+        assert steps["obj_002"]["status"] == "done"
+        assert steps["obj_002"]["iteration"] == 0
+
+    def test_a_failed_step_is_attempted_not_pending(self, planned):
+        """The state the old schema could not express at all."""
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_evaluation({"action_succeeded": "not_moved"})
+        planned.end_iteration()
+        steps = {s["object_id"]: s for s in planned.plan_steps()}
+        assert steps["obj_002"]["status"] == "attempted"
+
+    def test_exactly_one_step_is_next(self, planned):
+        assert [s["status"] for s in planned.plan_steps()].count("next") == 1
+
+    def test_the_context_shows_the_position(self, planned):
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_evaluation({"action_succeeded": "success"})
+        planned.end_iteration()
+        ctx = planned.planner_context()
+        assert "1 of 2 steps done" in ctx
+
+    def test_off_plan_actions_are_flagged(self, planned):
+        """The geometric fallback acts on objects the plan never named."""
+        planned.begin_iteration(0, action="remove", object_id="obj_999")
+        planned.record_evaluation({"action_succeeded": "success"})
+        planned.end_iteration()
+        assert "not in the plan" in planned.planner_context()
+
+    def test_an_emptied_plan_does_not_read_as_never_planned(self, planned):
+        """Opposite advice: "you have not planned" vs "your plan is complete"."""
+        planned.amend_grand_plan({"removal_order": []}, "everything is clear", 1)
+        ctx = planned.planner_context()
+        assert "not set yet" not in ctx
+        assert "no removal steps remain" in ctx
+
+
+class TestPlannerStateIsTheBoundary:
+    """One file for what the system runs on, one for what explains a run."""
+
+    def test_it_is_written_beside_the_archive(self, tmp_path):
+        state = st.SessionState(tmp_path / "run")
+        state.start("g", {"id": "obj_001", "label": "banana"})
+        assert (tmp_path / "run" / st.PLANNER_STATE_FILE).is_file()
+
+    def test_it_is_much_smaller_than_the_archive(self, planned):
+        import json
+
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_plan({"pose": [[1, 2, 3, 4]] * 4, "score": 0.9}, None)
+        planned.record_agent_rounds([{"round": 0, "code": "x" * 4000, "plan": "y" * 2000}])
+        planned.record_evaluation({"action_succeeded": "success"})
+        planned.end_iteration()
+        lean = len(json.dumps(planned.planner_state()))
+        archive = len(json.dumps(planned.progress))
+        assert lean < archive / 3, (lean, archive)
+
+    def test_it_carries_no_poses_or_transcripts(self, planned):
+        import json
+
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_plan({"pose": [[1, 2, 3, 4]] * 4, "score": 0.9}, None)
+        planned.record_agent_rounds([{"round": 0, "code": "SECRET_CODE_MARKER"}])
+        planned.record_evaluation({"action_succeeded": "success"})
+        planned.end_iteration()
+        blob = json.dumps(planned.planner_state())
+        assert "SECRET_CODE_MARKER" not in blob
+        assert "pose" not in blob
+
+    def test_the_prompt_cannot_drift_from_the_file(self, planned):
+        """planner_context renders from planner_state, so they agree by construction."""
+        planned.begin_iteration(0, action="remove", object_id="obj_002")
+        planned.record_evaluation({"action_succeeded": "not_moved",
+                                   "evidence": "UNIQUE_EVIDENCE_STRING"})
+        planned.end_iteration()
+        assert "UNIQUE_EVIDENCE_STRING" in planned.planner_context()
+        assert any(
+            h.get("evidence") == "UNIQUE_EVIDENCE_STRING"
+            for h in planned.planner_state()["history"]
+        )

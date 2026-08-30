@@ -53,6 +53,17 @@ DEFAULT_MATCH_RADIUS_M = 0.08
 # perception3d.MIN_OBJECT_POINTS, which is also GraspGen-X's own floor.
 MIN_INSTANCE_POINTS = 100
 
+#: Footprint gap below which two objects are treated as touching.
+#:
+#: Not zero, because a single depth view sees only the front of an object and
+#: fits its footprint 1.0-1.7 cm small (§7.3). Two objects genuinely in contact
+#: therefore measure as a gap of roughly that much, and a threshold of zero
+#: would never fire. 2 cm covers the bias without reaching for objects that are
+#: merely nearby — which is the whole point of the redefinition: "touching"
+#: means it may resist the pick or topple when the target is lifted away, not
+#: "the hand might not fit", which the grasp search answers properly.
+TOUCH_MARGIN_M = 0.02
+
 # Below this `visibility`, an instance's footprint is not to be trusted.
 #
 # The threshold is high because the measurement says it has to be. Occluding the
@@ -82,18 +93,28 @@ class Blocker:
 
     object_id: str
     label: str
-    reasons: List[str]  # any of "occlusion", "approach", "proximity"
+    reasons: List[str]  # "occlusion", "contact", or "fouls_grasp"
     occlusion_frac: float = 0.0
-    sweep_points: int = 0
     gap_m: float = float("inf")
+    #: How many of the target's best grasp candidates this object collided
+    #: with. Set only by the grasp-derived check, which is the one that speaks
+    #: about the grasps that actually exist rather than a synthesised one.
+    grasps_fouled: int = 0
 
     @property
     def severity(self) -> float:
-        """A rough ordering for the planner. Not a probability, just a rank."""
+        """A rough ordering for the planner. Not a probability, just a rank.
+
+        Occlusion leads, because clearing an occluder buys information nothing
+        else can. Fouling the real grasp candidates comes next — it is measured
+        against the poses the sampler actually proposed. Contact is last: it is
+        a warning about what may happen when the hand closes, not a claim that
+        the target cannot be reached.
+        """
         return (
             2.0 * self.occlusion_frac
-            + min(self.sweep_points / 200.0, 2.0)
-            + (1.0 if "proximity" in self.reasons else 0.0)
+            + min(self.grasps_fouled / 10.0, 1.5)
+            + (0.5 if "contact" in self.reasons else 0.0)
         )
 
     def describe(self) -> dict:
@@ -102,7 +123,7 @@ class Blocker:
             "label": self.label,
             "reasons": list(self.reasons),
             "occlusion_frac": round(self.occlusion_frac, 3),
-            "sweep_points": int(self.sweep_points),
+            "grasps_fouled": int(self.grasps_fouled),
             "gap_cm": (
                 round(self.gap_m * 100, 1) if np.isfinite(self.gap_m) else None
             ),
@@ -524,37 +545,62 @@ class SceneRegistry:
     def blocking_objects(
         self,
         target_id: str,
-        grasp_pose: Optional[np.ndarray] = None,
         gripper_name: str = "franka_panda",
-        approach_len: float = 0.12,
         occlusion_thresh: float = 0.05,
-        proximity_margin_m: float = 0.01,
     ) -> List[Blocker]:
-        """Everything standing between the robot and the target.
+        """Objects that must move before the target can be picked up.
+
+        Two reasons, and only two, because only two survive contact with the
+        question "would removing this actually help?".
+
+        * **occlusion** — it hides the target. Whatever is behind it cannot be
+          perceived, so any grasp computed from that view is computed from a
+          fragment. Clearing it buys information nothing else can.
+        * **contact** — it is touching the target. It may resist the pick, and
+          it may topple when the target is lifted out from beside it. Neither
+          is about reaching; both are about what happens when the hand closes.
+
+        **Two earlier tests were deleted rather than tuned**, because both
+        answered a question they could not answer:
+
+        * *approach* swept a single **synthesised top-down** pose and asked what
+          fell inside it. One direction out of the many a real grasp can come
+          from, so a "yes" said nothing about the grasps that matter. Across
+          every recorded run it fired **zero** times — it is skipped while the
+          target is occluded, and by the time the target is visible the
+          occluders have gone.
+        * *proximity* flagged anything within half the width of the whole hand
+          (10.4 cm on a Panda) of the target, on the assumption the hand must
+          fit broadside between them. It need not: the hand can come in from
+          anywhere. It also disagreed with placement's 3 cm margin, so an object
+          could be legally set down and instantly re-flagged.
+
+        What replaces them is not a heuristic at all. When the target *is*
+        visible, the grasp sampler proposes ~416 poses and the collision filter
+        rejects some of them; `image_patch` records **which object's points**
+        fouled the best ones. That names the objects genuinely standing between
+        the robot and a good grasp, from every direction the sampler tried,
+        measured rather than assumed.
 
         `grasp_pose` enables the approach test. Without one, a nominal top-down
         grasp closing across the target's short axis is synthesised — that is the
         grasp a parallel jaw would actually choose, and it means the loop can
         reason about reachability before it has spent an inference on it.
 
-        **The geometric tests are skipped while the target is badly occluded**,
-        and this is the important subtlety. Approach and proximity both need the
-        target's footprint, and a footprint fitted to a 19%-visible fragment is
-        the wrong size in the wrong place with the wrong orientation, so both
-        tests would return confident nonsense. While the target is hidden,
-        occlusion alone decides. That is not a gap: clearing the occluders makes
-        the target visible, at which point its footprint becomes trustworthy and
-        the geometric tests take over and find the second-order blockers. The
-        loop discovers them in the order it can actually establish them.
+        **The contact test is skipped while the target is badly occluded**, and
+        that is deliberate. It needs the target's footprint, and a footprint
+        fitted to a 19%-visible fragment is the wrong size in the wrong place
+        with the wrong orientation — it would return confident nonsense. While
+        the target is hidden, occlusion alone decides. That is not a gap:
+        clearing the occluders makes the target visible, at which point its
+        footprint becomes trustworthy and contact can be measured. The loop
+        establishes things in the only order it can.
 
         An empty result plus a grasp that survives scene-collision filtering is
         the loop's termination condition.
         """
         target = self.get(target_id)
-        gripper_pts = col.load_gripper_points(gripper_name)
-
         occl = self.occlusion_of(target_id)
-        jaw_half = float(np.abs(gripper_pts[:, 0]).max())
 
         blockers: Dict[str, Blocker] = {}
 
@@ -569,46 +615,124 @@ class SceneRegistry:
                 b.reasons.append("occlusion")
                 b.occlusion_frac = frac
 
-        geometry_is_meaningful = target.footprint_is_reliable or grasp_pose is not None
-        if not geometry_is_meaningful:
+        # The contact test needs the target's footprint, and a footprint fitted
+        # to a fragment is the wrong size in the wrong place. While the target
+        # is hidden, occlusion alone decides.
+        if not target.footprint_is_reliable:
             logger.info(
                 "%s is %.0f%% visible; reporting occlusion only until it is cleared",
                 target_id, target.visibility * 100,
             )
             return sorted(blockers.values(), key=lambda b: -b.severity)
 
-        if grasp_pose is None:
-            grasp_pose = self.nominal_grasp(target_id, gripper_name=gripper_name)
-
         for inst in self.instances.values():
             if inst.id == target_id:
                 continue
 
-            if grasp_pose is not None:
-                hits = col.points_inside_sweep(
-                    grasp_pose, inst.cloud, gripper_pts, approach_len=approach_len
-                )
-                if len(hits):
-                    b = entry(inst)
-                    if "approach" not in b.reasons:
-                        b.reasons.append("approach")
-                    b.sweep_points = int(len(hits))
-
-            if inst.footprint is not None and target.footprint is not None:
-                gap = float(
-                    np.linalg.norm(
-                        inst.footprint.centroid_xy - target.footprint.centroid_xy
-                    )
-                    - inst.footprint.radius_m
-                    - target.footprint.radius_m
-                )
-                if gap < jaw_half + proximity_margin_m:
-                    b = entry(inst)
-                    if "proximity" not in b.reasons:
-                        b.reasons.append("proximity")
-                    b.gap_m = gap
+            gap = self._surface_gap(target, inst)
+            if gap is not None and gap < TOUCH_MARGIN_M:
+                b = entry(inst)
+                if "contact" not in b.reasons:
+                    b.reasons.append("contact")
+                b.gap_m = gap
 
         return sorted(blockers.values(), key=lambda b: -b.severity)
+
+    @staticmethod
+    def _surface_gap(a: "ObjectInstance", b: "ObjectInstance") -> Optional[float]:
+        """Closest distance between two objects' measured surfaces, in metres.
+
+        Point cloud to point cloud, because the obvious alternative is wrong for
+        anything that is not round. Subtracting each footprint's *circumscribed*
+        radius treats a 16 cm banana as a circle of radius 8 cm, so a cylinder
+        3.75 cm away measures as **-3.5 cm** — apparently interpenetrating. That
+        is the same over-flagging the proximity test was deleted for, in a new
+        disguise.
+
+        The clouds are already held, so this costs one KD-tree query. It is
+        biased *large* by the single-view problem — two objects touching on
+        their hidden sides look separated — which `TOUCH_MARGIN_M` absorbs.
+        """
+        if a.cloud is None or b.cloud is None or not len(a.cloud) or not len(b.cloud):
+            return None
+        small, large = (a.cloud, b.cloud) if len(a.cloud) <= len(b.cloud) else (b.cloud, a.cloud)
+        tree = col.cKDTree(large) if hasattr(col, "cKDTree") else None
+        if tree is None:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(large)
+        d, _ = tree.query(small, k=1)
+        return float(np.min(d))
+
+    def reachable_grasp(
+        self, target_id: str, gripper_name: str = "franka_panda",
+        approach_len: float = 0.10,
+    ) -> Optional[np.ndarray]:
+        """A collision-free grasp on the target right now, or None.
+
+        The question the whole run exists to answer, asked directly instead of
+        inferred from a blocker list. Measured on `occluded_target` with one
+        occluder left: the banana is 78% visible, the mug is flagged as
+        blocking it, **and this returns a clear pose** — so the loop would have
+        spent a pick, a place and a re-perception to reach a state it was
+        already in.
+
+        Cheap on purpose: one synthesised top-down pose against the real scene
+        cloud, a few milliseconds. It is a *lower bound* on reachability — the
+        full sampler searches 416 poses from every direction — so a False here
+        does not prove the target is unreachable, only that the obvious grasp is
+        fouled. That asymmetry is the right way round: it never talks the loop
+        out of clearing something, only into trying the grasp it might already
+        have.
+        """
+        pose = self.nominal_grasp(target_id, gripper_name=gripper_name)
+        if pose is None:
+            return None
+        try:
+            scene = self.scene_cloud_excluding(target_id)
+        except RuntimeError:
+            return None
+        pts = col.load_gripper_points(gripper_name)
+        if not len(scene):
+            return pose
+        return pose if col.sweep_is_clear(
+            pose, scene, pts, approach_len=approach_len
+        ) else None
+
+    def colliding_instances(
+        self,
+        pose: np.ndarray,
+        gripper_name: str = "franka_panda",
+        exclude: Sequence[str] = (),
+        approach_len: float = 0.10,
+    ) -> List[tuple]:
+        """Which objects the hand at `pose` would hit, worst first.
+
+        The collision filter knew *that* a grasp was fouled and never *by what*:
+        `scene_cloud_excluding` flattens the scene into an anonymous point
+        array, so the identity was discarded before the test ran. Recovered here
+        by testing each instance's own cloud, which costs one sweep per object
+        and only runs when something has already gone wrong.
+
+        This is what lets a failure say "the bottle is in the way of the mug"
+        rather than "no grasp found" — and it is the only evidence that can
+        distinguish being blocked by a *specific* object from a hand that is
+        simply too small for the thing it was sent to pick up.
+        """
+        gripper_pts = col.load_gripper_points(gripper_name)
+        skip = set(exclude)
+        hits = []
+        for inst in self.instances.values():
+            if inst.id in skip:
+                continue
+            n = len(
+                col.points_inside_sweep(
+                    pose, inst.cloud, gripper_pts, approach_len=approach_len
+                )
+            )
+            if n:
+                hits.append((inst.id, inst.label, int(n)))
+        return sorted(hits, key=lambda h: -h[2])
 
     def nominal_grasp(
         self, object_id: str, gripper_name: str = "franka_panda", standoff_m: float = 0.005

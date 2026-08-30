@@ -71,6 +71,70 @@ def gripper_asset_dir(gripper_name: str) -> Optional[str]:
     return path if os.path.isdir(path) else None
 
 
+@lru_cache(maxsize=None)
+def gripper_config(gripper_name: str) -> dict:
+    """A gripper's `config.json`, or an empty dict if it is not installed.
+
+    One reader for a file three subsystems need and each used to open its own
+    way: the mask filter (jaw width, fingertip depth), `vis6d` (drawing a hand
+    that is the right shape), and the Observer's grasp summary (morphology).
+    Reading it three ways is how the overlay ended up drawing every gripper at
+    the Franka's fingertip depth.
+
+    Read-only: `lru_cache` hands the same dict to every caller.
+    """
+    asset_dir = gripper_asset_dir(gripper_name)
+    if not asset_dir:
+        return {}
+    try:
+        with open(os.path.join(asset_dir, "config.json")) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        logger.debug("could not read config.json for %s: %s", gripper_name, exc)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def gripper_morphology(gripper_name: str) -> dict:
+    """What kind of hand this is, in terms the Observer can reason about.
+
+    It was given a name string and a jaw width, which is not enough to judge
+    "can this hand close on that object" for anything but the gripper it had
+    already seen. `type` is the description's own label — `parallel_2f`,
+    `revolute_2f`, `revolute_3f` — and the finger count falls out of it.
+    """
+    cfg = gripper_config(gripper_name)
+    kind = str(cfg.get("type", "") or "")
+    fingers = None
+    if kind.endswith("f") and kind[-2:-1].isdigit():
+        fingers = int(kind[-2:-1])
+
+    out = {"name": gripper_name, "type": kind or "unknown", "n_fingers": fingers}
+    bbox = cfg.get("bbox")
+    try:
+        lo, hi = bbox[0], bbox[1]
+        out["extent_cm"] = [round((hi[i] - lo[i]) * 100, 1) for i in range(3)]
+    except (TypeError, IndexError, KeyError):
+        pass
+    return out
+
+
+def gripper_geometry(gripper_name: str) -> tuple:
+    """``(jaw aperture, base->fingertip depth)`` in metres.
+
+    Falls back to Franka-like numbers when the descriptions are not installed,
+    which then only affect projection and drawing, never a returned pose.
+    """
+    cfg = gripper_config(gripper_name)
+    try:
+        return (
+            float(cfg["sweep_volume"]["extents"][0]),
+            float(cfg["fingertip"][-1]),
+        )
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0.08, 0.11
+
+
 def _fallback_gripper_points(n: int) -> np.ndarray:
     """A Franka-sized box hull, for when the descriptions are not installed.
 

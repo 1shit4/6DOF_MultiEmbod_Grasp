@@ -10,8 +10,12 @@ Two audiences, and they pull in different directions:
 
 The old 2D pipeline drew a rotated rectangle (`grasp/utils.py`); a rectangle
 cannot express approach direction, which is precisely what 6-DoF adds. So we
-draw a projected gripper: the two fingers, the line they close along, and an
-arrow showing the approach axis.
+draw a projected gripper: the outline of the hand, the line its jaw closes
+along, and an arrow showing the approach axis.
+
+The outline is the gripper's **own** surface geometry, not a generic sketch.
+Four of the shipped grippers have three fingers, and drawing all of them as a
+parallel jaw meant the Observer was asked to judge a hand that did not exist.
 """
 
 from __future__ import annotations
@@ -61,6 +65,68 @@ def _gripper_wireframe(
     return {k: R @ np.asarray(v, dtype=np.float64) + t for k, v in local.items()}
 
 
+def _gripper_silhouette(
+    pose: np.ndarray,
+    K: np.ndarray,
+    gripper_name: str,
+    shape: tuple,
+    max_points: int = 1024,
+) -> Optional[list]:
+    """Outline of the *real* hand projected into the image, or None.
+
+    The seven-point wireframe above is a parallel jaw, and four of the shipped
+    grippers have three fingers — so the Observer was shown a hand that does
+    not exist while being told "the orange lines are the two fingers". Every
+    gripper description carries 10,500 surface points in the same frame the
+    pose uses; `collision.py` has been loading them all along for the collision
+    filter.
+
+    Traced from a rasterised point cloud rather than a convex hull on purpose:
+    the hull fills in the gap between the fingers, and that gap is the one part
+    of the picture the Observer is asked to read.
+    """
+    try:
+        from collision import load_gripper_points, transform_points
+
+        pts = load_gripper_points(gripper_name, state="open", max_points=max_points)
+    except Exception as exc:  # missing assets must not cost us the picture
+        logger.debug("no gripper geometry for %r: %s", gripper_name, exc)
+        return None
+
+    uv = project_points(transform_points(pts, pose), K)
+    uv = uv[np.isfinite(uv).all(axis=1)]
+    if len(uv) < 16:
+        return None
+
+    h, w = int(shape[0]), int(shape[1])
+    # Pad so a hand half out of frame still traces a sane outline instead of
+    # being clipped into a straight edge along the image border.
+    pad = 64
+    grid = np.zeros((h + 2 * pad, w + 2 * pad), np.uint8)
+    ij = np.round(uv + pad).astype(np.int64)
+    keep = (
+        (ij[:, 0] >= 0) & (ij[:, 0] < grid.shape[1])
+        & (ij[:, 1] >= 0) & (ij[:, 1] < grid.shape[0])
+    )
+    ij = ij[keep]
+    if len(ij) < 16:
+        return None
+
+    # Dot radius from the projected point density, so the outline closes at any
+    # viewing distance without bridging the jaw opening — the samples land a few
+    # pixels apart while the opening is tens of pixels wide.
+    spread = ij.max(axis=0) - ij.min(axis=0)
+    area = max(float(spread[0]) * float(spread[1]), 1.0)
+    radius = int(np.clip(round(0.6 * math.sqrt(area / len(ij))), 2, 10))
+    for x, y in ij:
+        cv2.circle(grid, (int(x), int(y)), radius, 255, -1)
+    grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = [c - pad for c in contours if cv2.contourArea(c) > 20.0]
+    return out or None
+
+
 def visualize_grasp_6dof(
     image: np.ndarray,
     grasp,
@@ -68,7 +134,7 @@ def visualize_grasp_6dof(
     save_folder: str | os.PathLike = "imgs/",
     filename: str = "grasp_pose_visualization.png",
     mask: Optional[np.ndarray] = None,
-    fingertip_depth: float = 0.11,
+    fingertip_depth: Optional[float] = None,
     finger_len: float = 0.05,
     draw_annotation: bool = True,
 ) -> Path:
@@ -77,9 +143,24 @@ def visualize_grasp_6dof(
     Always writes a file, even when the grasp cannot be projected — the
     Observer reads `execute_results["image"]` unconditionally and would crash
     on a missing path.
+
+    `fingertip_depth` defaults to the grasp's own gripper rather than to a
+    constant. It used to default to 0.11 m for everything, which is 3.4 cm out
+    on a Robotiq and 6 cm on an Inspire hand — and it is not even the Franka's
+    number (0.1034). The fingertip line is what the Observer is told to check
+    the object sits between, so drawing it in the wrong place quietly corrupted
+    every judgement on any hand but one.
     """
     if isinstance(grasp, dict):
         grasp = Grasp6D.from_dict(grasp)
+
+    if fingertip_depth is None:
+        try:
+            from collision import gripper_geometry
+
+            fingertip_depth = gripper_geometry(getattr(grasp, "gripper", "") or "")[1]
+        except Exception:
+            fingertip_depth = 0.11
 
     canvas = np.ascontiguousarray(np.asarray(image)[:, :, ::-1].copy())  # RGB->BGR
     h, w = canvas.shape[:2]
@@ -122,13 +203,26 @@ def visualize_grasp_6dof(
             cv2.arrowedLine(canvas, base, centre, COLOR_APPROACH, 3,
                             cv2.LINE_AA, tipLength=0.18)
 
-        # Finger shanks and the knuckle bar (back of the hand).
-        cv2.line(canvas, xy("left_knuckle"), xy("left_tip"), COLOR_FINGER, 5, cv2.LINE_AA)
-        cv2.line(canvas, xy("right_knuckle"), xy("right_tip"), COLOR_FINGER, 5, cv2.LINE_AA)
-        cv2.line(canvas, xy("left_knuckle"), xy("right_knuckle"), COLOR_FINGER, 5, cv2.LINE_AA)
+        # The hand itself: the real surface outline when the gripper
+        # descriptions are installed, the parallel-jaw wireframe otherwise.
+        outline = _gripper_silhouette(
+            grasp.pose, K, getattr(grasp, "gripper", "") or "", (h, w)
+        )
+        if outline:
+            cv2.drawContours(canvas, outline, -1, COLOR_FINGER, 3, cv2.LINE_AA)
+        else:
+            cv2.line(canvas, xy("left_knuckle"), xy("left_tip"), COLOR_FINGER, 5, cv2.LINE_AA)
+            cv2.line(canvas, xy("right_knuckle"), xy("right_tip"), COLOR_FINGER, 5, cv2.LINE_AA)
+            cv2.line(canvas, xy("left_knuckle"), xy("right_knuckle"), COLOR_FINGER, 5, cv2.LINE_AA)
+
         # The closing line between the fingertips — the "grasp" itself. Drawn
         # thinner than the orange hand so that when the view is nearly head-on
         # and the two become collinear, the orange still reads underneath.
+        # Spanned by the jaw aperture the model actually conditioned on, at the
+        # gripper's real fingertip depth. Measuring the extremes of the surface
+        # cloud instead looks more principled and is not: it returns the outer
+        # edge of the finger bodies (11.7 cm on a Panda whose jaw opens 8 cm),
+        # and on a three-finger hand the whole 33 cm width of the palm.
         cv2.line(canvas, xy("left_tip"), xy("right_tip"), COLOR_CLOSING, 2, cv2.LINE_AA)
         for n in ("left_tip", "right_tip"):
             cv2.circle(canvas, xy(n), 5, COLOR_CLOSING, -1, cv2.LINE_AA)

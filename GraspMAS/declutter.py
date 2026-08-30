@@ -49,7 +49,7 @@ from agents.task_planner import (
 )
 from evaluator import Evaluation, evaluate
 from execution import ExecutionReport, Observation, PickPlacePlan
-from scene_registry import SceneRegistry
+from scene_registry import Blocker, SceneRegistry
 from session_state import SessionState
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,20 @@ class DeclutterLoop:
         self.vlm_review = bool(vlm_review)
 
         self.registry = SceneRegistry()
+        # The person's own words, kept for the whole run. The inner loop needs
+        # them when fetching the target: how a knife should be held depends on
+        # what was asked for, and only this string carries that.
+        self.goal: str = ""
+        # Why the last grasp attempt produced nothing, when the reason is more
+        # informative than "no grasp found" — currently, that the critic
+        # rejected everything it was shown. Read once and cleared, so a stale
+        # reason cannot be attributed to a later iteration.
+        self._last_grasp_refusal: Optional[str] = None
+        # Objects a real grasp attempt on the target ran into: named by the
+        # collision filter over the ~416 poses the sampler actually proposed,
+        # not by a synthesised one. Populated only once a grasp has been tried,
+        # which is why the loop clears occluders first and asks this afterwards.
+        self._grasp_blockers: List[dict] = []
         self._previous: Optional[SceneRegistry] = None
         self._last_plan: Optional[PickPlacePlan] = None
         self._last_place_xy: Optional[np.ndarray] = None
@@ -175,6 +189,8 @@ class DeclutterLoop:
 
     async def run(self, goal: str, target: Optional[str] = None) -> DeclutterResult:
         self._stall_deferred = False
+        self._grasp_blockers = []
+        self.goal = goal or ""
         obs = self._perceive(0)
 
         choice, instance = await self._choose_target(goal, target, obs)
@@ -234,18 +250,16 @@ class DeclutterLoop:
                 }
                 self.state.snapshot(f"iter{index}_reidentified")
 
-            blockers = self.registry.blocking_objects(
-                target_id, gripper_name=self.gripper_name
-            )
+            # Occluders and objects touching the target, plus anything a real
+            # grasp attempt has already shown to stand in the hand's way.
+            blockers = self._blockers_for(target_id)
             decision = await self._decide(goal, target_id, blockers, obs)
 
             if decision.action == "defer":
-                # A decision declined on timing rather than possibility. Do not
-                # spend the iteration on nothing: fall back to the geometric
-                # choice and make real progress, carrying the refusal forward so
-                # the next decision is made knowing it happened. An iteration
-                # that acts is also an iteration the evidence counter can read,
-                # which the empty one was not.
+                # A refusal about timing, not possibility. Spend the iteration
+                # on the geometrically obvious move rather than on nothing: it
+                # makes real progress, and an iteration that acts is what turns
+                # "no evidence yet" into evidence.
                 fallback = self._scripted_decision(target_id, blockers)
                 fallback.corrections = list(decision.corrections) + [
                     f"falling back to the geometric choice for this iteration: "
@@ -410,7 +424,7 @@ class DeclutterLoop:
             if cand.object_id not in self.registry.instances:
                 continue
             blockers = self.registry.blocking_objects(
-                cand.object_id, gripper_name=self.gripper_name
+                cand.object_id, gripper_name=self.gripper_name,
             )
             # Recorded on the candidate as well as rendered, so the count the
             # model was shown is the count `progress.json` reports afterwards.
@@ -610,14 +624,18 @@ class DeclutterLoop:
         object_id = decision.object_id
         inst = self.registry.get(object_id)
 
-        grasp_dict = await self._grasp_for(object_id, obs, index)
+        grasp_dict = await self._grasp_for(object_id, obs, index, phase="declutter")
         if grasp_dict is None:
+            # Nothing was attempted, so nothing is reported as attempted. The
+            # *reason* is what lets the planner tell "this object cannot be
+            # picked up" from "something has to be cleared before it can be".
+            why = self._take_grasp_refusal() or f"no grasp could be computed for {object_id}"
             self.state.record_execution(
-                {"status": "failed", "error": f"no grasp found for {object_id}"}
+                {"status": "failed", "stage_reached": "plan", "error": why}
             )
             self.state.record_evaluation(
                 {"action_succeeded": "not_moved", "still_blocking_target": True,
-                 "evidence": f"no grasp could be computed for {object_id}"}
+                 "evidence": why}
             )
             return None
 
@@ -698,11 +716,27 @@ class DeclutterLoop:
 
     async def _grasp_target(self, target_id, obs, index, moved):
         """Final step: grasp the target, or report why we cannot."""
-        grasp = await self._grasp_for(target_id, obs, index)
+        grasp = await self._grasp_for(target_id, obs, index, phase="deliver")
         self.state.record_plan(grasp, None)
 
         if grasp is None:
-            self.state.note("no grasp survived filtering on the target")
+            self.state.note(
+                self._take_grasp_refusal() or "no grasp survived filtering on the target"
+            )
+            # Nothing occluding the target, nothing touching it, and still no
+            # grasp. The attempt itself says why: the collision filter rejected
+            # candidates and recorded which objects they ran into. Those become
+            # blockers for the next iteration — named by a real search over the
+            # poses the sampler proposed, not guessed from one top-down sweep.
+            if self._grasp_blockers:
+                named = ", ".join(
+                    f"{e['object_id']} ({e['label']})"
+                    for e in self._grasp_blockers[:3]
+                )
+                self.state.note(
+                    f"nothing occludes or touches the target, but the best grasps "
+                    f"on it collide with {named}; clearing those next"
+                )
             self.state.end_iteration()
             return None  # let the loop continue; something is still in the way
 
@@ -714,18 +748,81 @@ class DeclutterLoop:
             str(self.state.run_dir),
         )
 
-    async def _grasp_for(self, object_id: str, obs, index: int) -> Optional[dict]:
-        """A grasp on one instance, from the inner loop or from geometry alone."""
+    async def _grasp_for(
+        self, object_id: str, obs, index: int, phase: str = "declutter"
+    ) -> Optional[dict]:
+        """A grasp on one instance, from the inner loop or from geometry alone.
+
+        `phase` is "declutter" (this object is in the way and is being moved
+        aside) or "deliver" (this is the object the person actually asked for).
+        The two want different grasps on the same object — a knife being
+        shifted off the table should be taken by the handle, and a knife being
+        handed to a person is taken by the blade so the handle is what they
+        receive. The inner loop could not tell them apart, because both paths
+        sent it the same bare instance id.
+        """
         inst = self.registry.get(object_id)
 
         if self.graspmas is not None:
-            grasp = await self._grasp_via_agents(inst, obs, index)
+            grasp = await self._grasp_via_agents(inst, obs, index, phase)
             if grasp is not None:
                 return grasp
-            self.state.note(
-                f"the agent loop returned no grasp for {object_id}; "
-                "falling back to a nominal top-down grasp"
+
+            # Why the loop came back empty decides whether a geometric grasp is
+            # a reasonable substitute. Two very different cases used to share
+            # this branch:
+            #
+            #   * the loop never reached a verdict — a provider outage, a code
+            #     error, no candidates at all. A nominal grasp is a sensible
+            #     fallback and is what the outage guard is for.
+            #   * the Observer looked at a grasp and rejected it. Substituting a
+            #     geometric pose here silently overrides the critic, and it is
+            #     how a run came to report `success` carrying `score: 0.0,
+            #     source: "nominal"` after every round had been rejected.
+            review = getattr(self.graspmas, "observation_json", None) or {}
+            why = str(review.get("failure") or "unspecified")
+            # Which rejections should stop us acting depends on what the action
+            # is FOR, and the two phases differ:
+            #
+            #   * `geometry` and `wrong_object` stop us either way — the hand
+            #     would collide, or would move something nobody asked to move.
+            #   * `wrong_part` is a soft failure while decluttering. The job is
+            #     to get the object out of the way; a physically sound grasp on
+            #     the whole object does that, whatever sub-region was requested.
+            #     Blocking it here cost every clean run: on synthetic scenes an
+            #     object has no parts at all, so `find_part` correctly finds
+            #     none, the Observer correctly says `wrong_part` — and the loop
+            #     refused a grasp it had itself judged "physically feasible and
+            #     collision-free", then aborted for lack of options.
+            #   * when delivering, `wrong_part` is decisive. How the object is
+            #     held IS the request; handing someone a knife by the wrong end
+            #     is the failure the phase exists to prevent.
+            blocking_failures = ("geometry", "wrong_object")
+            refuses = str(review.get("verdict", "")).upper() == "INVALID" and (
+                phase == "deliver" or why in blocking_failures
             )
+            if refuses:
+                summary = str(review.get("summary") or "").strip()
+                self.state.note(
+                    f"no grasp on {object_id} passed review ({why})"
+                    + (f": {summary[:240]}" if summary else "")
+                )
+                self._last_grasp_refusal = (
+                    f"every grasp found on {object_id} was rejected on review "
+                    f"({why})"
+                )
+                return None
+
+            if str(review.get("verdict", "")).upper() == "INVALID":
+                self.state.note(
+                    f"the grasp on {object_id} was judged {why}, which does not "
+                    "prevent moving it aside; using a nominal top-down grasp"
+                )
+            else:
+                self.state.note(
+                    f"the agent loop returned no grasp for {object_id}; "
+                    "falling back to a nominal top-down grasp"
+                )
 
         pose = self.registry.nominal_grasp(object_id, gripper_name=self.gripper_name)
         if pose is None:
@@ -734,6 +831,7 @@ class DeclutterLoop:
             self.state.note(
                 f"the nominal top-down grasp on {object_id} is not collision-free"
             )
+            self._diagnose_obstruction(object_id, pose)
             return None
 
         from perception3d import Grasp6D
@@ -745,7 +843,115 @@ class DeclutterLoop:
         grasp = Grasp6D(pose=pose, score=0.0, gripper=self.gripper_name, width=width)
         return {**grasp.as_dict(), "source": "nominal"}
 
-    async def _grasp_via_agents(self, inst, obs, index):
+    def _take_grasp_refusal(self) -> Optional[str]:
+        """The last refusal reason, consumed so it cannot be reused."""
+        why, self._last_grasp_refusal = self._last_grasp_refusal, None
+        return why
+
+    @staticmethod
+    def _grasp_blockers_from_rounds(rounds) -> List[dict]:
+        """Objects the rejected grasp candidates ran into, gathered per round.
+
+        `grasp_detection` attributes each rejection to a named instance; this
+        merges what every round of the inner loop found, so an object that
+        fouled grasps twice counts twice.
+        """
+        tally: Dict[str, dict] = {}
+        for rd in rounds or []:
+            grasp = rd.get("grasp") or {}
+            for entry in (grasp.get("filters") or {}).get("fouled_by") or []:
+                oid = entry.get("object_id")
+                if not oid:
+                    continue
+                got = tally.setdefault(
+                    oid, {"object_id": oid, "label": entry.get("label", ""),
+                          "grasps_fouled": 0}
+                )
+                got["grasps_fouled"] += int(entry.get("grasps_fouled", 0))
+        return sorted(tally.values(), key=lambda e: -e["grasps_fouled"])
+
+    def _blockers_for(self, target_id: str):
+        """What must move before the target can be picked up.
+
+        Two measured reasons from the scene — it hides the target, or it is
+        touching it — plus anything a real grasp attempt has already shown to be
+        in the hand's way. That third source only exists after a grasp has been
+        tried, which is the whole shape of the loop: clear what obviously has to
+        go, try the grasp, and let the attempt itself name what else is wrong.
+        """
+        blockers = self.registry.blocking_objects(
+            target_id, gripper_name=self.gripper_name
+        )
+        if not self._grasp_blockers:
+            return blockers
+
+        by_id = {b.object_id: b for b in blockers}
+        for entry in self._grasp_blockers:
+            oid = entry.get("object_id")
+            if oid is None or oid == target_id or oid not in self.registry.instances:
+                continue
+            b = by_id.get(oid)
+            if b is None:
+                b = Blocker(
+                    object_id=oid,
+                    label=entry.get("label", "")
+                    or self.registry.instances[oid].label,
+                    reasons=[],
+                )
+                by_id[oid] = b
+            if "fouls_grasp" not in b.reasons:
+                b.reasons.append("fouls_grasp")
+            b.grasps_fouled = int(entry.get("grasps_fouled", 0))
+        return sorted(by_id.values(), key=lambda b: -b.severity)
+
+    def _diagnose_obstruction(self, object_id: str, pose) -> None:
+        """Name what is in the way of `object_id`, and what is in the way of THAT.
+
+        Gated on a geometric fact rather than on a model's opinion: it runs only
+        when a specific object is measurably inside the hand's swept volume. A
+        grasp that failed because the object is wider than the jaw, or because
+        the hand kept slipping, produces no attribution and no cascade — those
+        failures are not fixed by moving anything.
+
+        One level deep, deliberately. `blocking_objects` was only ever called on
+        the *target*, so a chain — B blocks A, A blocks the target — left B
+        invisible: nothing ever asked what was in A's way, and the run simply
+        failed to grasp A over and over. One level finds B. Recursing further
+        would turn a stuck run into a tour of the table.
+        """
+        fouled_by = self.registry.colliding_instances(
+            pose, gripper_name=self.gripper_name, exclude=(object_id,)
+        )
+        if not fouled_by:
+            # Unreachable, but not because of any one object — nothing to clear.
+            self.state.note(
+                f"nothing identifiable obstructs {object_id}; the hand does not "
+                "fit here for another reason"
+            )
+            return
+
+        named = ", ".join(f"{oid} ({label})" for oid, label, _ in fouled_by[:3])
+        self.state.note(f"{object_id} is obstructed by {named}")
+
+        # And what stands in the way of the worst offender, so the planner can
+        # see a two-step path rather than rediscovering the same wall.
+        worst = fouled_by[0][0]
+        try:
+            second = self.registry.blocking_objects(
+                worst, gripper_name=self.gripper_name
+            )
+        except Exception as exc:  # a diagnostic must never take the run down
+            logger.debug("second-level blocking analysis failed: %s", exc)
+            return
+        others = [b for b in second if b.object_id != object_id]
+        if others:
+            chain = ", ".join(f"{b.object_id} ({b.label})" for b in others[:3])
+            self.state.note(
+                f"and {worst} is itself blocked by {chain} — clearing {worst} "
+                f"may need {chain} moved first"
+            )
+
+    async def _grasp_via_agents(self, inst, obs, index, phase: str = "declutter"):
         """Run the inner Planner/Coder/Observer loop for one object."""
         import image_patch as ip
         from perception3d import SceneContext
@@ -754,7 +960,7 @@ class DeclutterLoop:
         ip.set_registry(self.registry)
         try:
             _out, grasp = await self.graspmas.query(
-                self._instruction(inst),
+                self._instruction(inst, phase, self.goal),
                 obs.rgb,
                 depth=obs.depth,
                 intrinsics=obs.K,
@@ -767,13 +973,26 @@ class DeclutterLoop:
         finally:
             ip.set_registry(None)
 
+        # What the collision filter said stood in the hand's way, from the
+        # candidates the sampler actually produced. Only meaningful for the
+        # target — a blocker's own blockers are a different question, handled
+        # by `_diagnose_obstruction`.
+        if phase == "deliver":
+            self._grasp_blockers = self._grasp_blockers_from_rounds(
+                getattr(self.graspmas, "rounds", None)
+            )
+
         self.state.record_agent_rounds(getattr(self.graspmas, "rounds", None))
-        if grasp is not None:
-            self.state.record_observer(getattr(self.graspmas, "observation_json", {}) or {})
+        # Recorded whether or not a grasp came back. The failure kind is most
+        # informative precisely when there is no grasp — and `wrong_object` is
+        # the one the inner loop cannot fix by construction, since the id was
+        # chosen out here. Gating this on success threw it away exactly when it
+        # mattered.
+        self.state.record_observer(getattr(self.graspmas, "observation_json", {}) or {})
         return grasp
 
     @staticmethod
-    def _instruction(inst) -> str:
+    def _instruction(inst, phase: str = "declutter", goal: str = "") -> str:
         """What to ask the inner loop for. The instance id has to be in the words.
 
         `find_by_id` exists, the registry is installed before the call, and the
@@ -787,9 +1006,27 @@ class DeclutterLoop:
         Naming the id costs nothing when labels happen to be unique, and is the
         difference between clearing the right bottle and the wrong one when they
         are not.
+
+        The id alone was all the inner loop ever got, which left it unable to
+        tell the two jobs apart. Clearing an obstruction wants the most secure
+        hold available; fetching what the person asked for is governed by what
+        they asked. On a knife those are opposite grips, so the phase and the
+        person's own words are stated here rather than inferred.
         """
         label = inst.descriptor or inst.label
-        return f"{inst.id} ({label})" if label else inst.id
+        who = f"{inst.id} ({label})" if label else inst.id
+
+        if phase == "deliver":
+            asked = f' The person asked: "{goal}".' if goal else ""
+            return (
+                f"Grasp {who} so it can be handed to the person.{asked}"
+                " Their request governs how it should be held."
+            )
+        return (
+            f"Grasp {who} in order to move it out of the way."
+            " It is an obstruction, not what the person asked for, so take"
+            " whichever hold is most secure — grasp a tool by its handle."
+        )
 
     def _reachable(self, pose, object_id: str) -> bool:
         """Is the hand clear of everything except the object it is grasping?"""

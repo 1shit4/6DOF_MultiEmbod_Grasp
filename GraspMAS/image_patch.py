@@ -3,6 +3,7 @@ from matplotlib import pyplot as plt
 import base64
 import logging
 import os
+import re
 import numpy as np
 import torch
 import torchvision
@@ -20,6 +21,7 @@ import detectron2.data.transforms as T
 from agents.llm import get_shared_llm
 from collision import (
     filter_grasps_by_scene_collision,
+    gripper_geometry,
     load_gripper_points,
     scene_cloud_excluding,
 )
@@ -101,9 +103,182 @@ NUM_GRASPS = 200
 PLANNER = "graspmoe"
 
 _GRASPGEN_CLIENT: Optional[GraspGenClient] = None
-# Keyed by (mask bytes hash, gripper) — a re-planned round often reuses the
-# same mask, and on CPU a cache hit saves seconds per call.
+# Keyed by (mask bytes hash, gripper, planner, num_grasps) — a re-planned round
+# often reuses the same mask, and on CPU a cache hit saves ~10 s per call.
+#
+# Holds the whole surviving *candidate set*, not the single pose picked from it.
+# It used to hold the winner, which made a re-plan after a rejection return a
+# bit-identical grasp: same mask, same key, same answer, and no way to ask for a
+# different one. See `_SELECTION_REGISTRY` below.
 _GRASP_CACHE: dict = {}
+
+# Masks that produced a grasp, so the overlay can tint the region the grasp was
+# actually computed for. The Observer's prompt describes that magenta region and
+# it was never drawn, because the mask lives in `grasp_detection` and the result
+# dict carries no way back to it.
+#
+# Keyed by a monotonic int stored on the result rather than by `id()` (which is
+# reused after a GC) or by "the last mask seen" (which is wrong whenever the
+# generated code computes a part grasp and an object grasp in one round). The
+# key is a plain int, so it serialises with the rest of the result harmlessly.
+_MASK_REGISTRY: dict = {}
+_MASK_SEQ = 0
+_MASK_REGISTRY_MAX = 64
+
+
+def _register_mask(mask: np.ndarray) -> int:
+    global _MASK_SEQ
+    _MASK_SEQ += 1
+    if len(_MASK_REGISTRY) >= _MASK_REGISTRY_MAX:
+        for stale in sorted(_MASK_REGISTRY)[: _MASK_REGISTRY_MAX // 2]:
+            _MASK_REGISTRY.pop(stale, None)
+    _MASK_REGISTRY[_MASK_SEQ] = mask
+    return _MASK_SEQ
+
+
+# The surviving candidate set behind each returned grasp, so a rejected grasp
+# can be replaced by a *different* one without asking the server again.
+#
+# GraspGen-X generates ~416 poses per call and 16-66 of them survive every
+# filter, with the runners-up typically within 0.02-0.05 of the winner. All but
+# one were discarded, so the only answer the loop had to "this grasp is wrong"
+# was to re-run the identical pipeline and get the identical pose back.
+#
+# Same monotonic-int handle as the mask registry, for the same reason: the
+# result dict has to be JSON-serialisable, so it carries a key rather than the
+# arrays themselves.
+_SELECTION_REGISTRY: dict = {}
+_SELECTION_SEQ = 0
+_SELECTION_REGISTRY_MAX = 16
+
+#: How many alternatives to hand back. Enough to re-choose from, few enough
+#: that the result stays a reasonable size when it is written to disk.
+MAX_RETURNED_CANDIDATES = 20
+
+
+def _register_selection(selection: dict) -> int:
+    global _SELECTION_SEQ
+    _SELECTION_SEQ += 1
+    if len(_SELECTION_REGISTRY) >= _SELECTION_REGISTRY_MAX:
+        for stale in sorted(_SELECTION_REGISTRY)[: _SELECTION_REGISTRY_MAX // 2]:
+            _SELECTION_REGISTRY.pop(stale, None)
+    _SELECTION_REGISTRY[_SELECTION_SEQ] = selection
+    return _SELECTION_SEQ
+
+
+def _build_grasp_result(sel: dict, chosen: int) -> dict:
+    """Assemble the returned grasp dict for one candidate of a selection.
+
+    Split out of `grasp_detection` so that choosing again costs nothing but a
+    dictionary rebuild — no depth, no unprojection, no server round trip.
+    """
+    grasps, scores = sel["grasps"], sel["scores"]
+    width, fingertip_depth = sel["width"], sel["fingertip_depth"]
+    grasp = Grasp6D(
+        pose=grasps[chosen],
+        score=float(scores[chosen]),
+        gripper=sel["gripper"],
+        width=width,
+        rect_2d=grasp_to_rect2d(
+            grasps[chosen], sel["K"], width, float(scores[chosen]),
+            fingertip_depth=fingertip_depth,
+        ),
+    )
+    result = grasp.as_dict()
+    result["mask_key"] = sel["mask_key"]
+    result["selection_key"] = sel["selection_key"]
+    result["filters"] = dict(sel["filters"])
+    result["chosen_index"] = int(chosen)
+
+    # The alternatives, best first: enough for generated code to filter on
+    # (score, where the hand sits, which way it comes in) without carrying a
+    # 4x4 matrix for each. The pose of whichever one is picked is recovered
+    # from the registry by `select_grasp`.
+    keep = sel["keep"]
+    order = keep[np.argsort(scores[keep])[::-1]][:MAX_RETURNED_CANDIDATES]
+    result["candidates"] = [
+        {
+            "index": int(i),
+            "score": round(float(scores[i]), 4),
+            "position": [round(float(v), 4) for v in grasps[i][:3, 3]],
+            "approach": [round(float(v), 4) for v in grasps[i][:3, 2]],
+            "closing": [round(float(v), 4) for v in grasps[i][:3, 0]],
+        }
+        for i in order
+    ]
+    return result
+
+
+#: How many of the best rejected candidates to attribute. Enough to see which
+#: object is responsible, few enough that the sweep stays cheap — each one costs
+#: a collision test per instance in the scene.
+MAX_ATTRIBUTED_CANDIDATES = 12
+
+
+def _grasped_instances(mask: np.ndarray) -> set:
+    """Registry instances the grasp mask actually covers.
+
+    Identified by overlap rather than by the patch's name, because `find()`
+    names a patch after a *label* while `find_by_id` names it after an id, and a
+    part mask from `find_part` is named after neither. Overlap works for all
+    three, including the part case: a knife handle's mask sits inside the
+    knife's, so the knife is correctly recognised as the object being grasped.
+    """
+    instances = getattr(REGISTRY, "instances", None) if REGISTRY is not None else None
+    if not instances:
+        return set()
+    got = set()
+    for oid, inst in instances.items():
+        if getattr(inst, "mask", None) is None:
+            continue
+        m = inst.mask
+        if m.shape != mask.shape:
+            continue
+        area = int(m.sum())
+        if area and int(np.logical_and(m, mask).sum()) > 0.5 * area:
+            got.add(oid)
+    return got
+
+
+def _attribute_collisions(rejected_poses, gripper_name: str, exclude=()) -> list:
+    """Which objects the rejected grasp candidates ran into, worst first.
+
+    The scene cloud the filter tests against is anonymous — depth pixels with
+    the target masked out — so it can say a candidate collided and never with
+    what. Recovering that turns "no grasp found on the mug" into "the box is
+    what stands between the hand and the mug", which is the difference between
+    a planner that can act and one that can only give up.
+
+    Needs the decluttering registry, so it is a no-op for one-shot queries.
+    """
+    if REGISTRY is None or not len(rejected_poses):
+        return []
+    tally: dict = {}
+    for pose in rejected_poses[:MAX_ATTRIBUTED_CANDIDATES]:
+        try:
+            hits = REGISTRY.colliding_instances(
+                pose, gripper_name=gripper_name, exclude=tuple(exclude)
+            )
+        except Exception as exc:  # a diagnostic must never break a working grasp
+            logger.debug("could not attribute a collision: %s", exc)
+            return []
+        for oid, label, _n in hits:
+            entry = tally.setdefault(oid, {"object_id": oid, "label": label,
+                                           "grasps_fouled": 0})
+            entry["grasps_fouled"] += 1
+    return sorted(tally.values(), key=lambda e: -e["grasps_fouled"])
+
+
+def grasp_mask(grasp: Optional[dict]) -> Optional[np.ndarray]:
+    """The mask a grasp was computed from, if it is still held.
+
+    Returns None rather than raising when the entry has been evicted — the
+    overlay degrades to an untinted picture, which is what it always drew.
+    """
+    if not isinstance(grasp, dict):
+        return None
+    return _MASK_REGISTRY.get(grasp.get("mask_key"))
+
 
 # The decluttering loop's instance registry, when one is running. It gives the
 # generated code `find_by_id` (unambiguous with duplicate objects) and gives
@@ -710,15 +885,97 @@ class ImagePatch:
         # whichever branch produced the value.
         return -float(np.median(prediction.squeeze().cpu().numpy()))
 
+    #: How many alternative names to try when the requested one scores nothing.
+    #: Two, not "until something matches". A wider search is slower, spends
+    #: requests, and — the real cost — makes it likelier that a term matching
+    #: *some* region gets accepted as the region that was asked for. The
+    #: Observer sees the substitution and judges whether it was the right one.
+    MAX_PART_SYNONYMS = 2
+
+    def _vlpart_query(self, image_np, inputs, text_prompt):
+        """Run VLPart for one phrasing. Returns (boxes above threshold, best score).
+
+        The `"{object} {part}"` two-word shape is load-bearing and measured:
+        on the mustard bottle in `real_world/00`, `bottle cap` scores 0.590,
+        a bare `cap` scores 0.003 and `the cap of the bottle` 0.062. Do not
+        "improve" this into a sentence.
+        """
+        with torch.no_grad():
+            predictions = vlpart.inference([inputs], text_prompt=text_prompt)[0]
+
+        filter_boxes, best = [], 0.0
+        if "instances" in predictions:
+            instances = predictions["instances"].to("cpu")
+            boxes = instances.pred_boxes.tensor if instances.has("pred_boxes") else None
+            scores = instances.scores if instances.has("scores") else None
+            if scores is not None and len(scores):
+                best = float(scores.max())
+                for obj_ind in range(len(scores)):
+                    if float(scores[obj_ind]) < THRESHOLD_VLPART:
+                        continue
+                    filter_boxes.append(boxes[obj_ind])
+        return filter_boxes, best
+
+    def _part_synonyms(self, object_name: str, part_name: str) -> list:
+        """Other names for the same physical region, from the model. Best effort.
+
+        Asked for rather than tabulated: a hardcoded synonym list only covers
+        the objects whoever wrote it thought of, and the point of having a
+        language model in the loop is that it knows the ones we did not.
+
+        The wording insists on the SAME region, because a plausible synonym is
+        not automatically the same piece of the object — "grip" and "handle"
+        coincide on a mug and not on a pair of scissors. That risk is why the
+        result is reported as a substitution rather than silently accepted.
+        """
+        try:
+            reply = self.llm_query(
+                f"A vision system could not locate the '{part_name}' of a "
+                f"{object_name}. Give up to {self.MAX_PART_SYNONYMS} alternative "
+                f"single-word names for the SAME physical region of a "
+                f"{object_name}. Reply with only the words, comma-separated, no "
+                f"explanation. If there is no other name for it, reply NONE.",
+                long_answer=False,
+            )
+        except Exception as exc:  # no key, offline, provider down — not fatal
+            logger.debug("find_part: could not ask for alternative names: %s", exc)
+            return []
+
+        out, seen = [], {part_name.strip().lower()}
+        for token in re.split(r"[,\n;]+", str(reply or "")):
+            word = token.strip().strip(".\"'").lower()
+            if not word or word == "none" or word in seen:
+                continue
+            if len(word.split()) > 2:  # a sentence, not a name
+                continue
+            seen.add(word)
+            out.append(word)
+            if len(out) >= self.MAX_PART_SYNONYMS:
+                break
+        return out
+
     def find_part(self, object_name: str, part_name: str) -> ImagePatch:
         """Returns a ImagePatch object of the part of the object
+
+        A failed lookup is usually a naming problem rather than an absent part:
+        VLPart is open-vocabulary, and on the same bottle `cap` scores 0.590
+        while `lid` scores 0.058 — a tenfold gap for one physical feature. So
+        the requested term is tried first and, only if it finds nothing, up to
+        `MAX_PART_SYNONYMS` alternatives are asked for and tried.
+
+        Whatever happens is reported on the returned patch rather than hidden:
+        `part_found`, `part_term` (what actually matched), `part_substituted`
+        and `part_terms_tried`. A substitution is a *guess about wording* and
+        may well be a guess about the wrong region, so the Observer is told and
+        can reject it.
+
         Parameters
         ----------
-        object_name: 
+        object_name:
             name of the object
-        part_name: 
+        part_name:
             name of the part of the object
-            
+
         Returns
         -------
         ImagePatch
@@ -730,45 +987,52 @@ class ImagePatch:
         image = preprocess.get_transform(image_np).apply_image(image_np)
         image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
         inputs = {"image": image, "height": height, "width": width}
-        
-        text_prompt = f'{object_name} {part_name}'
-        with torch.no_grad():
-            predictions = vlpart.inference([inputs], text_prompt=text_prompt)[0]
-            
-        boxes, masks = None, None
-        filter_scores, filter_boxes, filter_classes = [], [], []
 
-        if "instances" in predictions:
-            instances = predictions['instances'].to('cpu')
-            boxes = instances.pred_boxes.tensor if instances.has("pred_boxes") else None
-            scores = instances.scores if instances.has("scores") else None
-            classes = instances.pred_classes.tolist() if instances.has("pred_classes") else None
+        tried, scores_seen = [], {}
+        filter_boxes, matched = [], part_name
+        for term in [part_name]:
+            tried.append(term)
+            filter_boxes, best = self._vlpart_query(
+                image_np, inputs, f"{object_name} {term}"
+            )
+            scores_seen[term] = round(best, 3)
+            if filter_boxes:
+                matched = term
+                break
 
-            num_obj = len(scores)
-            for obj_ind in range(num_obj):
-                category_score = scores[obj_ind]
-                if category_score < THRESHOLD_VLPART:
-                    continue
-                filter_scores.append(category_score)
-                filter_boxes.append(boxes[obj_ind])
-                filter_classes.append(classes[obj_ind])
+        if not filter_boxes:
+            for term in self._part_synonyms(object_name, part_name):
+                tried.append(term)
+                filter_boxes, best = self._vlpart_query(
+                    image_np, inputs, f"{object_name} {term}"
+                )
+                scores_seen[term] = round(best, 3)
+                if filter_boxes:
+                    matched = term
+                    logger.info(
+                        "find_part: no '%s' on the %s, but '%s' matched (%.2f)",
+                        part_name, object_name, term, best,
+                    )
+                    break
+
         if len(filter_boxes) == 0:
-            # VLPart's vocabulary is finite: it segments cap/lid/body/propeller
-            # on this scene but has no concept of a toy plane's "wing" or a
-            # bowl's "rim". Upstream silently returned the whole object here, so
-            # a caller could not tell a part-level grasp from an object-level one
-            # — which matters, because part-level grounding is the headline claim.
-            # The fallback stays (a whole-object grasp beats no grasp), but it is
-            # now announced and flagged on the returned patch.
+            # The fallback stays — a whole-object grasp beats no grasp — but it
+            # is announced and flagged, so a caller can tell a part-level grasp
+            # from an object-level one. Part-level grounding is the headline
+            # claim; silently dropping it made the claim unverifiable.
             logger.warning(
-                "find_part: VLPart found no '%s' on the %s above threshold %.2f; "
-                "falling back to the whole object",
-                part_name, object_name, THRESHOLD_VLPART,
+                "find_part: VLPart found no '%s' on the %s above threshold %.2f "
+                "(tried %s, best scores %s); falling back to the whole object",
+                part_name, object_name, THRESHOLD_VLPART, tried, scores_seen,
             )
             fallback = self.crop(0, 0, self.width, self.height, mask=self.mask,
                                  object_name=f"{object_name}_{part_name}")
             fallback.part_found = False
+            fallback.part_term = None
+            fallback.part_substituted = False
+            fallback.part_terms_tried = dict(scores_seen)
             return fallback
+
         inputs = segmentor_processor(images=image_np, input_boxes=[[filter_boxes]], return_tensors="pt").to(device)
 
         outputs = segmentator(**inputs)
@@ -785,8 +1049,11 @@ class ImagePatch:
         left, lower, right, upper = map(int, filter_boxes[0])
         obj = self.crop(left, self.height-upper, right, self.height-lower, mask=mask_original, object_name=f"{object_name}_{part_name}")
         obj.part_found = True
+        obj.part_term = matched
+        obj.part_substituted = matched != part_name
+        obj.part_terms_tried = dict(scores_seen)
         return obj
-        
+
     def grasp_detection(self, object_patch, gripper_name: str = None, round_idx: int = 0):
         """Return the best 6-DoF grasp pose for the object/part in object_patch.
 
@@ -841,9 +1108,11 @@ class ImagePatch:
 
         gripper = gripper_name or GRIPPER_NAME
         cache_key = (hash(mask.tobytes()), gripper, PLANNER, NUM_GRASPS)
-        if cache_key in _GRASP_CACHE:
+        cached = _GRASP_CACHE.get(cache_key)
+        if cached is not None:
             logger.info("grasp_detection: cache hit for %s", gripper)
-            return _GRASP_CACHE[cache_key]
+            best = int(cached["keep"][int(np.argmax(cached["scores"][cached["keep"]]))])
+            return _build_grasp_result(cached, best)
 
         try:
             depth = SCENE.get_depth(image)
@@ -916,7 +1185,8 @@ class ImagePatch:
             fingertip_depth=fingertip_depth,
         )
         keep = visible[in_mask] if len(in_mask) else visible
-        if len(in_mask) == 0:
+        fell_back_to_score = len(in_mask) == 0
+        if fell_back_to_score:
             logger.warning(
                 "grasp_detection: none of %d visible grasps landed inside the "
                 "mask; ranking by score alone", len(visible)
@@ -928,15 +1198,34 @@ class ImagePatch:
         #    isolated object this filter is a no-op; in clutter it is the
         #    difference between a plan and a collision.
         n_on_target = len(keep)
+        every_candidate_collides = False
+        collision_checked = False
+        fouled_by: list = []
         scene_cloud = _scene_cloud_excluding(mask)
         if scene_cloud is not None and len(scene_cloud):
+            collision_checked = True
             gripper_pts = load_gripper_points(gripper)
             clear = filter_grasps_by_scene_collision(
                 grasps[keep], scene_cloud, gripper_pts, approach_len=0.08
             )
+            # Which objects the *rejected* candidates ran into. This is what
+            # replaces the old approach test, and it is a different kind of
+            # answer: that test swept one synthesised top-down pose and asked
+            # what fell inside it, so a hit said nothing about the grasps that
+            # actually exist. This asks which objects stand between the robot
+            # and the best poses the sampler really proposed, across every
+            # direction it tried.
+            rejected = np.setdiff1d(np.arange(len(keep)), clear, assume_unique=False)
+            # The object being grasped is always inside the hand — that is what
+            # a grasp is — so it must not be reported as standing in its own way.
+            fouled_by = _attribute_collisions(
+                grasps[keep[rejected]], gripper, exclude=_grasped_instances(mask)
+            )
+
             if len(clear):
                 keep = keep[clear]
             else:
+                every_candidate_collides = True
                 logger.warning(
                     "grasp_detection: all %d on-target grasps collide with the "
                     "rest of the scene; keeping them so the Observer can see why",
@@ -950,17 +1239,6 @@ class ImagePatch:
 
         best_local = int(np.argmax(scores[keep]))
         best_idx = int(keep[best_local])
-
-        grasp = Grasp6D(
-            pose=grasps[best_idx],
-            score=float(scores[best_idx]),
-            gripper=gripper,
-            width=width,
-            rect_2d=grasp_to_rect2d(
-                grasps[best_idx], K, width, float(scores[best_idx]),
-                fingertip_depth=fingertip_depth,
-            ),
-        )
 
         if RECORDER is not None:
             RECORDER.save_grasps(
@@ -976,10 +1254,110 @@ class ImagePatch:
                 },
             )
 
-        logger.info("grasp_detection: %s", grasp.summary())
-        result = grasp.as_dict()
-        _GRASP_CACHE[cache_key] = result
+        # How the winner was arrived at. All of this was computed and then
+        # logged to a file nobody reads: the Observer was asked to judge the
+        # approach and the collision risk from a 2D projection while the exact
+        # answers sat here. The comment on the fallback above literally says
+        # "keeping them so the Observer can see why" — and it was never told.
+        filters = {
+            "n_candidates": int(n_all),
+            "n_visible": int(len(visible)),
+            "n_on_target": int(n_on_target),
+            "n_clear_of_scene": int(len(keep)),
+            "collision_checked": bool(collision_checked),
+            # The two fallbacks. Each means "no candidate satisfied this test,
+            # so the constraint was dropped rather than returning nothing" —
+            # which makes the winner the least bad of a bad set, not a good one.
+            "every_candidate_collides": bool(every_candidate_collides),
+            "no_candidate_inside_mask": bool(fell_back_to_score),
+            # False means find_part could not find the part and handed back the
+            # whole object, so this grasp is not on the region asked for.
+            "part_found": getattr(object_patch, "part_found", None),
+            # True means the requested word found nothing and a different word
+            # did. The region matched is a guess about naming and may not be the
+            # region that was asked for, so the Observer is told rather than
+            # left to assume the request was honoured.
+            "part_substituted": getattr(object_patch, "part_substituted", False),
+            "part_term": getattr(object_patch, "part_term", None),
+            # Which objects the rejected candidates ran into. Empty when nothing
+            # was rejected, or outside the decluttering loop where there is no
+            # registry to attribute against.
+            "fouled_by": fouled_by,
+        }
+
+        # Cache the whole surviving set, not the one pose picked from it. The
+        # cache used to hold the single winner, which is why a re-plan after a
+        # rejection returned a bit-identical grasp: same mask, same key, same
+        # answer. Keeping the set means re-choosing is free and *different*.
+        selection = {
+            "grasps": grasps,
+            "scores": scores,
+            "keep": keep,
+            "gripper": gripper,
+            "width": width,
+            "fingertip_depth": fingertip_depth,
+            "K": K,
+            "mask_key": _register_mask(mask),
+            "filters": filters,
+        }
+        selection["selection_key"] = _register_selection(selection)
+        _GRASP_CACHE[cache_key] = selection
+
+        result = _build_grasp_result(selection, best_idx)
+        logger.info(
+            "grasp_detection: %s (+%d alternatives)",
+            Grasp6D.from_dict(result).summary(), max(len(result["candidates"]) - 1, 0),
+        )
         return result
+
+    @staticmethod
+    def select_grasp(grasp: dict, candidates) -> Optional[dict]:
+        """Pick a different grasp from the ones `grasp_detection` already found.
+
+        `grasp["candidates"]` holds the alternatives that survived every filter,
+        best first. Filter that list however the situation calls for and pass
+        what is left here; the highest-scoring survivor is returned as a full
+        grasp, with no call to the grasp server.
+
+        This is what makes an Observer rejection actionable. Without it the only
+        reply to "that grasp is wrong" was to re-run the identical pipeline on
+        the identical mask and get the identical pose back.
+
+        Parameters
+        ----------
+        grasp : dict
+            A result from `grasp_detection`.
+        candidates : list[dict]
+            A subset of `grasp["candidates"]` — or anything with an "index".
+
+        Returns
+        -------
+        dict or None
+            The best remaining grasp, or None if nothing was left. None means
+            "every alternative was ruled out", which is worth reporting rather
+            than working around.
+        """
+        sel = _SELECTION_REGISTRY.get((grasp or {}).get("selection_key"))
+        if sel is None:
+            logger.warning(
+                "select_grasp: this grasp's candidate set is no longer held; "
+                "call grasp_detection again"
+            )
+            return None
+
+        wanted = []
+        for c in candidates or []:
+            idx = c.get("index") if isinstance(c, dict) else c
+            if idx is None:
+                continue
+            wanted.append(int(idx))
+        if not wanted:
+            logger.warning("select_grasp: no candidates left after filtering")
+            return None
+
+        scores = sel["scores"]
+        best = max(wanted, key=lambda i: float(scores[i]))
+        return _build_grasp_result(sel, best)
 
     def find_by_id(self, object_id: str) -> "ImagePatch":
         """Return the registered instance `object_id` as a patch.
@@ -1106,24 +1484,12 @@ class ImagePatch:
         Read from `gripper_descriptions` so the numbers match what the server
         conditioned on; falls back to Franka-like values, which then only affect
         projection and drawing, never the returned pose.
+
+        Delegates to `collision.gripper_geometry`. It used to open `config.json`
+        itself, which is how the overlay came to draw every gripper at the
+        Franka's fingertip depth while this read the real one.
         """
-        cfg_root = os.environ.get("GRASPGENX_GRIPPER_CFG_DIR")
-        if cfg_root:
-            cfg_path = os.path.join(
-                cfg_root, "gripper_descriptions", "assets", "x_grippers",
-                gripper_name, "config.json",
-            )
-            try:
-                import json
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                width = float(cfg["sweep_volume"]["extents"][0])
-                # Same field SweepVolumeParams.from_gripper_config reads.
-                depth = float(cfg["fingertip"][-1])
-                return width, depth
-            except Exception as exc:
-                logger.debug("Could not read geometry for %s: %s", gripper_name, exc)
-        return 0.08, 0.11
+        return gripper_geometry(gripper_name)
 
     @classmethod
     def _gripper_jaw_width(cls, gripper_name: str) -> float:

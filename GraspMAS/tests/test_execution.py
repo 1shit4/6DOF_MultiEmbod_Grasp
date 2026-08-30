@@ -313,13 +313,45 @@ class TestFailureInjection:
             ex.true_position(report.grasped_object)[:2] - before[report.grasped_object][:2]
         ) > 0.01
 
-    def test_injection_is_always_announced(self):
+    def test_injection_is_recorded_as_ground_truth(self):
+        """The fault must leave a trace — for us, not for the planner."""
         for mode in ("offset", "drop", "tip", "collateral", "wrong_object"):
             ex = MutationExecutor(ss.occluded_target_scene(), inject=[mode], seed=5)
             report = ex.execute_pick_place(_plan_for(ex, "bottle"))
-            text = " ".join(report.notes) + (report.error or "")
-            assert "injected" in text, mode
+            assert report.ground_truth.get("injected", "").startswith(mode.split(":")[0]), mode
             assert not report.ok, mode
+
+    def test_the_cause_never_reaches_the_planner(self):
+        """The planner has to INFER the failure, not read it.
+
+        `report.error` used to say "injected: the object slipped out of the jaw
+        on lift" — the exact conclusion the loop is supposed to reach on its
+        own — and it flowed through the evaluator's evidence into
+        `planner_context`. Every recorded "recovery" had the answer key. A real
+        arm reports where the hand got to and what moved, never the cause.
+        """
+        for mode in ("offset", "drop", "tip", "collateral", "wrong_object"):
+            ex = MutationExecutor(ss.occluded_target_scene(), inject=[mode], seed=5)
+            report = ex.execute_pick_place(_plan_for(ex, "bottle"))
+            visible = " ".join(report.notes) + (report.error or "")
+            assert "injected" not in visible.lower(), (mode, visible)
+            assert mode not in visible.lower(), (mode, visible)
+            # And describe(), which is what the loop stores and shows, must not
+            # carry it either — the field is for the analysis log alone.
+            assert "ground_truth" not in report.describe(), mode
+            assert "ground_truth" in report.describe_with_ground_truth(), mode
+
+    def test_the_observable_outcome_is_still_reported(self):
+        """Stripping the cause must not strip the evidence.
+
+        `not_moved` has the same geometric signature for three causes — no
+        contact, a slip, an object too heavy. Geometry cannot separate them, but
+        `stage_reached` can, and a real arm has it. So it stays.
+        """
+        ex = MutationExecutor(ss.occluded_target_scene(), inject=["drop"], seed=5)
+        report = ex.execute_pick_place(_plan_for(ex, "bottle"))
+        assert report.stage_reached == "lift"
+        assert report.error, "a failure with no observable description at all"
 
 
 def _declutter(executor, target_label, use_keep_out, max_steps=5):

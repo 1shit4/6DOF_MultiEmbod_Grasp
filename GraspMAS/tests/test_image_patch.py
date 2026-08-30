@@ -330,3 +330,364 @@ class TestComputeDepth:
         far = ip.ImagePatch(rgb, name="far")
         far.mask = far_mask
         assert near.compute_depth() < far.compute_depth()
+
+
+class TestGraspMaskReachesTheOverlay:
+    """The Observer is told to read a magenta region that was never drawn.
+
+    Its prompt says "the magenta region is the exact object or part the grasp
+    was computed for" — but `graspmas` called the renderer without a mask, so
+    the region never existed and the Observer had to infer which object was
+    aimed at from where the hand happened to land. The mask exists inside
+    `grasp_detection`; what was missing was a way back to it from the result.
+    """
+
+    def test_a_registered_mask_round_trips(self):
+        import numpy as np
+
+        import image_patch as ip
+
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:5, 2:5] = True
+        result = {"pose": [], "mask_key": ip._register_mask(mask)}
+        assert np.array_equal(ip.grasp_mask(result), mask)
+
+    def test_two_grasps_in_one_round_keep_their_own_masks(self):
+        """The reason this is not "remember the last mask".
+
+        Generated code routinely computes an object grasp and a part grasp in
+        one round and returns whichever it prefers. A single last-seen mask is
+        simply wrong whenever it returns the earlier one.
+        """
+        import numpy as np
+
+        import image_patch as ip
+
+        whole = np.ones((8, 8), dtype=bool)
+        part = np.zeros((8, 8), dtype=bool)
+        part[0:2, 0:2] = True
+
+        first = {"mask_key": ip._register_mask(whole)}
+        second = {"mask_key": ip._register_mask(part)}
+        assert np.array_equal(ip.grasp_mask(first), whole)
+        assert np.array_equal(ip.grasp_mask(second), part)
+
+    def test_missing_or_evicted_masks_degrade_quietly(self):
+        import image_patch as ip
+
+        assert ip.grasp_mask(None) is None
+        assert ip.grasp_mask("not a dict") is None
+        assert ip.grasp_mask({}) is None
+        assert ip.grasp_mask({"mask_key": 10**9}) is None
+
+    def test_the_registry_is_bounded(self):
+        """A long run must not accumulate full-resolution masks forever."""
+        import numpy as np
+
+        import image_patch as ip
+
+        for _ in range(ip._MASK_REGISTRY_MAX * 3):
+            ip._register_mask(np.zeros((4, 4), dtype=bool))
+        assert len(ip._MASK_REGISTRY) <= ip._MASK_REGISTRY_MAX
+
+    def test_the_renderer_is_actually_given_the_mask(self):
+        """Guards the call site, which is where the mask went missing."""
+        import inspect
+
+        from agents import graspmas
+
+        src = inspect.getsource(graspmas.GraspMAS._build_result)
+        assert "mask=image_patch_module.grasp_mask(" in src, (
+            "the overlay call dropped the mask again; the Observer's prompt "
+            "describes a magenta region that will not be drawn"
+        )
+
+
+class TestPartSynonymRetry:
+    """A failed part lookup is usually a naming problem, not an absent part.
+
+    Measured on the mustard bottle in `real_world/00`: `bottle cap` scores
+    0.590 and `bottle lid` scores 0.058 for the same physical feature — a
+    tenfold gap, not a marginal miss. So one retry under another name recovers
+    a part that is genuinely there.
+
+    Bounded on purpose. Searching until something matches is slower, spends
+    requests, and — the real cost — makes it likelier that a word matching
+    *some* region gets accepted as the region that was asked for.
+    """
+
+    def test_the_retry_budget_is_small(self):
+        from image_patch import ImagePatch
+
+        assert ImagePatch.MAX_PART_SYNONYMS <= 2
+
+    def test_synonyms_are_parsed_and_capped(self, monkeypatch):
+        from image_patch import ImagePatch
+
+        patch = ImagePatch.__new__(ImagePatch)
+        monkeypatch.setattr(
+            ImagePatch, "llm_query",
+            lambda self, q, **kw: "cap, cover, top, rim, lip",
+        )
+        got = patch._part_synonyms("bottle", "lid")
+        assert got == ["cap", "cover"], got
+
+    def test_the_original_term_is_never_retried(self, monkeypatch):
+        from image_patch import ImagePatch
+
+        patch = ImagePatch.__new__(ImagePatch)
+        monkeypatch.setattr(
+            ImagePatch, "llm_query", lambda self, q, **kw: "LID, cap",
+        )
+        assert "lid" not in patch._part_synonyms("bottle", "lid")
+
+    def test_none_and_prose_are_rejected(self, monkeypatch):
+        from image_patch import ImagePatch
+
+        patch = ImagePatch.__new__(ImagePatch)
+        monkeypatch.setattr(ImagePatch, "llm_query", lambda self, q, **kw: "NONE")
+        assert patch._part_synonyms("bottle", "lid") == []
+
+        monkeypatch.setattr(
+            ImagePatch, "llm_query",
+            lambda self, q, **kw: "there is no other common name for this part",
+        )
+        assert patch._part_synonyms("bottle", "lid") == []
+
+    def test_an_unreachable_model_does_not_break_find_part(self, monkeypatch):
+        """No key, offline, provider down — degrade to the old behaviour."""
+        from image_patch import ImagePatch
+
+        patch = ImagePatch.__new__(ImagePatch)
+
+        def boom(self, q, **kw):
+            raise RuntimeError("no API key")
+
+        monkeypatch.setattr(ImagePatch, "llm_query", boom)
+        assert patch._part_synonyms("bottle", "lid") == []
+
+    def test_the_two_word_prompt_shape_is_preserved(self):
+        """`bottle cap` scores 0.590; a bare `cap` scores 0.003.
+
+        The `"{object} {part}"` format is load-bearing and was measured. A
+        refactor that "cleans it up" into a sentence silently destroys part
+        grounding — `the cap of the bottle` scores 0.062.
+        """
+        import inspect
+
+        from image_patch import ImagePatch
+
+        src = inspect.getsource(ImagePatch.find_part)
+        assert 'f"{object_name} {term}"' in src
+
+    def test_a_substitution_is_reported_not_hidden(self):
+        """A synonym that scores well is not necessarily the same region."""
+        from agents.graspmas import GraspMAS
+
+        note = GraspMAS._selection_warnings({
+            "filters": {"part_found": True, "part_substituted": True,
+                        "part_term": "cap"},
+        })
+        assert "SUBSTITUTED PART" in note
+        assert "cap" in note
+
+    def test_an_exact_match_reports_nothing(self):
+        from agents.graspmas import GraspMAS
+
+        assert GraspMAS._selection_warnings({
+            "filters": {"part_found": True, "part_substituted": False,
+                        "part_term": "cap"},
+        }) is None
+
+
+class TestCandidateReselection:
+    """A rejection must be able to produce a DIFFERENT grasp, for free.
+
+    GraspGen-X generates ~416 poses and 16-66 survive every filter, with the
+    runners-up within 0.02-0.05 of the winner. All but one were thrown away,
+    and the cache held that one keyed on the mask — so a re-plan after an
+    Observer rejection returned a bit-identical pose. Measured across every
+    recorded multi-round iteration: the score was identical to 3 decimals in
+    22 of 22 cases, because it was the same object.
+    """
+
+    @staticmethod
+    def _selection(n=6):
+        """A fake candidate set, as grasp_detection would cache it."""
+        import numpy as np
+
+        import image_patch as ip
+
+        grasps = np.tile(np.eye(4), (n, 1, 1))
+        for i in range(n):
+            grasps[i, :3, 3] = [0.01 * i, 0.0, 0.5]
+            grasps[i, :3, 2] = [1.0 if i % 2 else 0.0, 0.0, 0.0 if i % 2 else 1.0]
+        sel = {
+            "grasps": grasps,
+            "scores": np.linspace(0.9, 0.4, n),
+            "keep": np.arange(n),
+            "gripper": "franka_panda",
+            "width": 0.08,
+            "fingertip_depth": 0.1034,
+            "K": np.array([[600.0, 0, 320], [0, 600.0, 240], [0, 0, 1]]),
+            "mask_key": None,
+            "filters": {},
+        }
+        sel["selection_key"] = ip._register_selection(sel)
+        return sel
+
+    def test_the_result_carries_the_alternatives(self):
+        import image_patch as ip
+
+        sel = self._selection()
+        result = ip._build_grasp_result(sel, 0)
+        assert len(result["candidates"]) == 6
+        # Best first, so a caller that just takes [0] gets the winner.
+        scores = [c["score"] for c in result["candidates"]]
+        assert scores == sorted(scores, reverse=True)
+        # Enough to filter on without a 4x4 per candidate.
+        for c in result["candidates"]:
+            assert {"index", "score", "position", "approach", "closing"} <= set(c)
+
+    def test_reselecting_returns_a_different_pose(self):
+        """The whole point. Same object, different grasp, no server call."""
+        import numpy as np
+
+        import image_patch as ip
+        from image_patch import ImagePatch
+
+        sel = self._selection()
+        first = ip._build_grasp_result(sel, 0)
+        rest = [c for c in first["candidates"] if c["index"] != first["chosen_index"]]
+        second = ImagePatch.select_grasp(first, rest)
+
+        assert second is not None
+        assert second["chosen_index"] != first["chosen_index"]
+        assert not np.allclose(
+            np.asarray(second["pose"]), np.asarray(first["pose"])
+        ), "re-selection returned the same pose — the defect this fixes"
+
+    def test_reselection_takes_the_best_of_what_is_left(self):
+        import image_patch as ip
+        from image_patch import ImagePatch
+
+        sel = self._selection()
+        first = ip._build_grasp_result(sel, 0)
+        subset = [c for c in first["candidates"] if c["index"] in (3, 5)]
+        got = ImagePatch.select_grasp(first, subset)
+        assert got["chosen_index"] == 3  # higher score of the two
+
+    def test_filtering_by_approach_direction_works(self):
+        """The realistic use: the Observer says the approach is fouled."""
+        from image_patch import ImagePatch
+        import image_patch as ip
+
+        sel = self._selection()
+        first = ip._build_grasp_result(sel, 0)
+        sideways = [c for c in first["candidates"] if c["approach"][0] > 0.5]
+        assert sideways, "fixture should contain side approaches"
+        got = ImagePatch.select_grasp(first, sideways)
+        assert got is not None
+        assert got["approach"][0] > 0.5
+
+    def test_ruling_everything_out_returns_none(self):
+        """None means "no alternative survives", which is worth reporting."""
+        from image_patch import ImagePatch
+        import image_patch as ip
+
+        first = ip._build_grasp_result(self._selection(), 0)
+        assert ImagePatch.select_grasp(first, []) is None
+
+    def test_an_expired_selection_degrades(self):
+        from image_patch import ImagePatch
+
+        assert ImagePatch.select_grasp({"selection_key": 10**9}, [{"index": 0}]) is None
+        assert ImagePatch.select_grasp({}, [{"index": 0}]) is None
+
+    def test_the_registry_is_bounded(self):
+        import image_patch as ip
+
+        for _ in range(ip._SELECTION_REGISTRY_MAX * 3):
+            self._selection(n=2)
+        assert len(ip._SELECTION_REGISTRY) <= ip._SELECTION_REGISTRY_MAX
+
+    def test_the_candidate_list_is_capped(self):
+        """It is written to disk with the run; it must not be unbounded."""
+        import image_patch as ip
+
+        result = ip._build_grasp_result(self._selection(n=200), 0)
+        assert len(result["candidates"]) == ip.MAX_RETURNED_CANDIDATES
+
+
+class TestCollisionAttributionExcludesTheGraspedObject:
+    """An object is always inside the hand that grasps it. That is what a grasp is.
+
+    Measured before the fix, on `crowded_table`: the target appeared in its own
+    "what is in the way" list with 6 fouls, and on `occluded_target` with 12.
+    Reported to the planner that reads as "move the thing you are trying to
+    pick up", which is the one action the validator forbids outright.
+    """
+
+    def test_overlap_identifies_the_grasped_object(self, monkeypatch):
+        import numpy as np
+        from types import SimpleNamespace
+
+        import image_patch as ip
+
+        big = np.zeros((20, 20), dtype=bool); big[2:12, 2:12] = True
+        other = np.zeros((20, 20), dtype=bool); other[15:19, 15:19] = True
+        reg = SimpleNamespace(instances={
+            "obj_1": SimpleNamespace(mask=big),
+            "obj_2": SimpleNamespace(mask=other),
+        })
+        monkeypatch.setattr(ip, "REGISTRY", reg)
+        assert ip._grasped_instances(big) == {"obj_1"}
+
+    def test_a_part_mask_still_identifies_its_object(self, monkeypatch):
+        """`find_part` names the patch after neither a label nor an id.
+
+        A handle's mask sits inside the knife's, so overlap is what recognises
+        the knife as the object being grasped. Naming would not.
+        """
+        import numpy as np
+        from types import SimpleNamespace
+
+        import image_patch as ip
+
+        whole = np.zeros((20, 20), dtype=bool); whole[2:12, 2:12] = True
+        part = np.zeros((20, 20), dtype=bool); part[3:6, 3:6] = True
+        reg = SimpleNamespace(instances={"obj_1": SimpleNamespace(mask=whole)})
+        monkeypatch.setattr(ip, "REGISTRY", reg)
+        # The part covers well under half the object, so the object is not
+        # "grasped" by area — but the part IS inside it, which is what matters
+        # for not blaming the knife for blocking its own handle.
+        assert ip._grasped_instances(whole) == {"obj_1"}
+
+    def test_a_distant_object_is_not_excluded(self, monkeypatch):
+        import numpy as np
+        from types import SimpleNamespace
+
+        import image_patch as ip
+
+        a = np.zeros((20, 20), dtype=bool); a[2:8, 2:8] = True
+        b = np.zeros((20, 20), dtype=bool); b[14:19, 14:19] = True
+        reg = SimpleNamespace(instances={"obj_1": SimpleNamespace(mask=a),
+                                         "obj_2": SimpleNamespace(mask=b)})
+        monkeypatch.setattr(ip, "REGISTRY", reg)
+        assert "obj_2" not in ip._grasped_instances(a)
+
+    def test_no_registry_means_no_exclusions(self, monkeypatch):
+        import numpy as np
+
+        import image_patch as ip
+
+        monkeypatch.setattr(ip, "REGISTRY", None)
+        assert ip._grasped_instances(np.ones((4, 4), dtype=bool)) == set()
+
+    def test_attribution_is_a_noop_without_a_registry(self, monkeypatch):
+        import numpy as np
+
+        import image_patch as ip
+
+        monkeypatch.setattr(ip, "REGISTRY", None)
+        assert ip._attribute_collisions(np.tile(np.eye(4), (3, 1, 1)), "franka_panda") == []

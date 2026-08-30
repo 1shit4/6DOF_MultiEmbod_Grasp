@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 PROGRESS_FILE = "progress.json"
+PLANNER_STATE_FILE = "planner_state.json"
 GRAND_PLAN_FILE = "grand_plan.json"
 
 # Fields of the grand plan no agent may change. The goal is the user's, not the
@@ -531,15 +532,34 @@ class SessionState:
             raise RuntimeError("no iteration is open; call begin_iteration first")
         return self._current
 
+    @staticmethod
+    def _slim_grasp(grasp: Optional[dict]) -> Optional[dict]:
+        """A grasp as it should be *stored*, without its alternatives.
+
+        `grasp_detection` returns up to 20 candidates so that a rejection can be
+        answered with a different pose. They are consumed from an in-memory
+        registry, never read back from here, and the recorder already writes all
+        ~416 of them to a `.npz` — in a better form than JSON. Keeping a copy in
+        the state file costs ~3 KB per grasp, duplicated per round, for nothing.
+        """
+        if not isinstance(grasp, dict) or "candidates" not in grasp:
+            return grasp
+        slim = {k: v for k, v in grasp.items() if k != "candidates"}
+        slim["n_candidates_available"] = len(grasp.get("candidates") or [])
+        return slim
+
     def record_plan(self, grasp: Optional[dict], place: Optional[dict]) -> None:
-        self.current.planned = {"grasp": grasp, "place": place}
+        self.current.planned = {"grasp": self._slim_grasp(grasp), "place": place}
 
     def record_observer(self, observation: Optional[dict]) -> None:
         self.current.observer = dict(observation or {})
 
     def record_agent_rounds(self, rounds: Optional[Sequence[dict]]) -> None:
         """The inner loop's reasoning for this iteration, round by round."""
-        self.current.agent_rounds = [dict(r) for r in (rounds or [])]
+        self.current.agent_rounds = [
+            {**r, "grasp": self._slim_grasp(r.get("grasp"))} if "grasp" in r else dict(r)
+            for r in (rounds or [])
+        ]
 
     def record_decision(self, decision: Optional[dict]) -> None:
         """What the outer task planner decided, and why."""
@@ -617,6 +637,25 @@ class SessionState:
     @property
     def next_index(self) -> int:
         return len(self.progress["iterations"])
+
+    def has_acted(self) -> bool:
+        """Has this run actually tried to move anything yet?
+
+        The bar a retarget has to clear. It replaces a count of iterations
+        without progress, which conflated two things: a target that has
+        genuinely resisted effort, and a target nobody has lifted a finger for.
+        Only the first is evidence.
+
+        Deliberately low. It rules out the failure that was *measured* — the
+        model switching at iteration 0 because the alternative was "fully
+        visible and unobstructed, making it a more efficient and immediate
+        solution", i.e. because it was easier — without demanding that a run
+        grind through two futile iterations before it may say so.
+        """
+        return any(
+            rec.action not in NON_ACTING_ACTIONS and rec.object_id
+            for rec in self.iterations
+        )
 
     def attempts_on(self, object_id: str) -> List[IterationRecord]:
         return [r for r in self.iterations if r.object_id == object_id]
@@ -717,71 +756,259 @@ class SessionState:
             )
         return ""
 
-    def planner_context(self, max_iterations: int = 6) -> str:
-        """A compact digest of the run so far, for the planner prompt.
+    def plan_steps(self) -> List[dict]:
+        """The grand plan's steps, each with what became of it.
 
-        Deliberately terse: the planner needs what was tried and what came of
-        it, not a transcript. Truncated from the end because recent iterations
-        are what bear on the next decision.
+        The plan and the history were two disconnected lists: `removal_order`
+        carried no status, so "attempted twice and failed" was neither done nor
+        skipped nor pending, and the planner had to re-derive its own position
+        by joining the two in-context on every call. That join is arithmetic; it
+        belongs here.
         """
-        lines = []
-        if self.grand_plan:
-            order = self.grand_plan.get("removal_order", [])
-            # Defensive: this renders straight into a prompt, and a malformed
-            # step must not take the run down. The writers normalise, so a
-            # non-mapping here means something bypassed them.
-            steps = ", ".join(
-                f"{s.get('object_id', '?')} ({s.get('label', '?')})"
-                if isinstance(s, dict) else f"{s} (?)"
-                for s in order
-            ) or "(none)"
-            lines.append(f"GRAND PLAN — remove in order: {steps}")
-            if self.grand_plan.get("success_criterion"):
-                lines.append(f"  done when: {self.grand_plan['success_criterion']}")
-            for rev in self.grand_plan.get("revisions", []):
-                lines.append(
-                    f"  revised at iteration {rev['iteration']}: "
-                    f"{', '.join(rev['changed'])} — {rev['reason']}"
-                )
-            lines.append(f"  revisions left: {self.revisions_left}")
-        else:
-            lines.append("GRAND PLAN — not set yet")
+        order = (self.grand_plan or {}).get("removal_order") or []
+        outcome: Dict[str, tuple] = {}
+        for rec in self.iterations:
+            if rec.action != "remove" or not rec.object_id:
+                continue
+            got = (rec.evaluation or {}).get("action_succeeded")
+            # Later iterations supersede earlier ones for the same object.
+            outcome[rec.object_id] = (got, rec.index)
 
-        history = self.iterations
-        lines.append("")
-        if not history:
-            lines.append("HISTORY — nothing attempted yet; this is the first iteration.")
-            return "\n".join(lines)
+        steps, pending_seen = [], False
+        for step in order:
+            if not isinstance(step, dict):
+                continue
+            oid = step.get("object_id")
+            got, at = outcome.get(oid, (None, None))
+            if got == "success":
+                status = "done"
+            elif got is not None:
+                status = "attempted"
+            elif not pending_seen:
+                status, pending_seen = "next", True
+            else:
+                status = "pending"
+            steps.append({
+                "object_id": oid,
+                "label": step.get("label", ""),
+                "status": status,
+                "iteration": at,
+            })
+        return steps
 
-        shown = history[-max_iterations:]
-        if len(history) > len(shown):
-            lines.append(f"HISTORY — {len(history) - len(shown)} earlier iteration(s) omitted")
-        else:
-            lines.append("HISTORY")
+    def off_plan_actions(self, within=None) -> List[dict]:
+        """Iterations that acted on something the grand plan never named.
+
+        The geometric fallback does this routinely, and nothing marked it — so
+        the planner saw an object move that its plan does not mention and had no
+        way to tell that from a step it had forgotten.
+
+        Scoped to the same window as the history it accompanies: an unbounded
+        list of off-plan notes for iterations too old to be shown is noise, and
+        the digest earns its keep by being short.
+        """
+        named = {
+            s.get("object_id")
+            for s in ((self.grand_plan or {}).get("removal_order") or [])
+            if isinstance(s, dict)
+        }
+        records = self.iterations if within is None else within
+        return [
+            {"iteration": rec.index, "object_id": rec.object_id}
+            for rec in records
+            if rec.action == "remove" and rec.object_id and rec.object_id not in named
+        ]
+
+    def planner_state(self, max_iterations: int = 6) -> dict:
+        """Exactly what the task planner is told, as data.
+
+        Written to `planner_state.json` beside the archive, so the boundary
+        between "what the system runs on" and "what we keep to explain a run"
+        is a file you can open rather than a function you have to call. What is
+        *not* here — poses, waypoints, generated code, agent transcripts,
+        timestamps — is in `progress.json` and is for us, not for the planner.
+        """
+        history = []
+        shown = self.iterations[-max_iterations:]
         for rec in shown:
             ev = rec.evaluation or {}
             outcome = ev.get("action_succeeded", "not evaluated")
-            blocking = ev.get("still_blocking_target")
+            entry = {
+                "iteration": rec.index,
+                "action": rec.action or "n/a",
+                "object_id": rec.object_id,
+                "object_label": rec.object_label,
+                "outcome": outcome,
+                "still_blocking_target": ev.get("still_blocking_target"),
+                "evidence": ev.get("evidence"),
+                "notes": list(rec.notes),
+            }
+            if outcome not in ("success", "not evaluated"):
+                detail = self._grasp_difficulty(rec)
+                if detail:
+                    entry["grasp_difficulty"] = detail
+            history.append(entry)
+
+        steps = self.plan_steps()
+        return {
+            "goal": self.progress.get("goal"),
+            "target": self.progress.get("target"),
+            "grand_plan": {
+                "success_criterion": (self.grand_plan or {}).get("success_criterion", ""),
+                "steps": steps,
+                "done": sum(1 for s in steps if s["status"] == "done"),
+                "total": len(steps),
+                "revisions": [
+                    {"iteration": r.get("iteration"), "changed": r.get("changed"),
+                     "reason": r.get("reason")}
+                    for r in ((self.grand_plan or {}).get("revisions") or [])
+                ],
+                "revisions_left": self.revisions_left,
+            },
+            "off_plan_actions": self.off_plan_actions(within=shown),
+            "iterations_omitted": max(len(self.iterations) - len(shown), 0),
+            "history": history,
+            "retargets_used": self.retargets_used,
+            "target_candidates": list(self.target_candidates),
+        }
+
+    def planner_context(self, max_iterations: int = 6) -> str:
+        """A compact digest of the run so far, for the planner prompt.
+
+        Rendered from `planner_state()` so the prompt and `planner_state.json`
+        cannot drift: whatever the file says is what the planner was told.
+
+        Deliberately terse — the planner needs what was tried and what came of
+        it, not a transcript. But the *selection* used to be wrong: it kept the
+        evaluator's verdict and dropped both the grasp score and where the run
+        had got to in its own plan, so a planner could not tell "the grasp was
+        sound and the hand slipped" from "we never found a sound grasp", nor
+        which step it was on.
+        """
+        st = self.planner_state(max_iterations=max_iterations)
+        plan = st["grand_plan"]
+        lines = []
+
+        if plan["total"]:
+            lines.append(
+                f"GRAND PLAN — {plan['done']} of {plan['total']} steps done"
+            )
+            mark = {"done": "[x]", "attempted": "[!]", "next": "->", "pending": "[ ]"}
+            for step in plan["steps"]:
+                who = f"{step['object_id']}"
+                if step["label"]:
+                    who += f" ({step['label']})"
+                tail = {
+                    "done": f" — done, iteration {step['iteration']}",
+                    "attempted": f" — attempted at iteration {step['iteration']}, not cleared",
+                    "next": " — next",
+                    "pending": "",
+                }[step["status"]]
+                lines.append(f"  {mark[step['status']]} {who}{tail}")
+        elif self.grand_plan is None:
+            lines.append("GRAND PLAN — not set yet")
+        else:
+            # Set, then revised down to nothing. Saying "not set yet" here reads
+            # as "you have not planned", when what happened is "your plan is
+            # complete or was amended away" — opposite advice.
+            lines.append(
+                "GRAND PLAN — no removal steps remain (the plan was revised "
+                "to empty, or nothing needed moving)"
+            )
+
+        if plan["success_criterion"]:
+            lines.append(f"  done when: {plan['success_criterion']}")
+        for rev in plan["revisions"]:
+            lines.append(
+                f"  revised at iteration {rev['iteration']}: "
+                f"{', '.join(rev['changed'] or [])} — {rev['reason']}"
+            )
+        if plan["total"] or plan["revisions"]:
+            lines.append(f"  revisions left: {plan['revisions_left']}")
+
+        for off in st["off_plan_actions"]:
+            lines.append(
+                f"  ! iteration {off['iteration']} acted on {off['object_id']}, "
+                "which is not in the plan"
+            )
+
+        lines.append("")
+        if not st["history"]:
+            lines.append("HISTORY — nothing attempted yet; this is the first iteration.")
+            return "\n".join(lines)
+
+        if st["iterations_omitted"]:
+            lines.append(
+                f"HISTORY — {st['iterations_omitted']} earlier iteration(s) omitted"
+            )
+        else:
+            lines.append("HISTORY")
+
+        for rec in st["history"]:
+            blocking = rec["still_blocking_target"]
             blocking_txt = (
                 "still blocking" if blocking is True
                 else "no longer blocking" if blocking is False
                 else "blocking status unknown"
             )
-            who = f"{rec.object_id} ({rec.object_label})" if rec.object_id else "-"
-            lines.append(
-                f"  [{rec.index}] {rec.action or 'n/a'} {who}: {outcome}, {blocking_txt}"
+            who = (
+                f"{rec['object_id']} ({rec['object_label']})"
+                if rec["object_id"] else "-"
             )
-            if ev.get("evidence"):
-                lines.append(f"        {ev['evidence']}")
-            for n in rec.notes:
+            lines.append(
+                f"  [{rec['iteration']}] {rec['action']} {who}: "
+                f"{rec['outcome']}, {blocking_txt}"
+            )
+            if rec.get("evidence"):
+                lines.append(f"        {rec['evidence']}")
+            if rec.get("grasp_difficulty"):
+                lines.append(f"        {rec['grasp_difficulty']}")
+            for n in rec["notes"]:
                 lines.append(f"        note: {n}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _grasp_difficulty(rec) -> str:
+        """One line on what the inner loop went through to produce this grasp."""
+        bits = []
+        rounds = rec.agent_rounds or []
+        attempts = [r for r in rounds if r.get("grasp")]
+        if attempts:
+            best = max(
+                float((r.get("grasp") or {}).get("score") or 0.0) for r in attempts
+            )
+            bits.append(f"grasp {best:.2f}")
+        elif rounds:
+            bits.append("no grasp found")
+
+        obs = rec.observer or {}
+        verdict = str(obs.get("verdict", "") or "").upper()
+        failure = str(obs.get("failure", "") or "")
+        if verdict == "INVALID":
+            bits.append(
+                f"critic rejected it ({failure})" if failure and failure != "none"
+                else "critic rejected it"
+            )
+        elif verdict:
+            bits.append(f"critic: {verdict.lower()}")
+
+        if len(rounds) > 1:
+            # Say WHOSE attempts these are. "2 attempts" was read by the planner
+            # as two failed *iterations* on the object — which is the trigger
+            # for its own two-strikes rule — and it aborted a recoverable run
+            # after a single failure. These are rounds inside one iteration.
+            bits.append(f"{len(rounds)} grasp attempts within this one iteration")
+        return "; ".join(bits)
 
     # -- persistence -------------------------------------------------------
 
     def save(self) -> None:
         self.progress["updated_at"] = _utc_now()
         _atomic_write_json(self.run_dir / PROGRESS_FILE, self.progress)
+        # The system-consumed view, written beside the archive. Two files with
+        # two jobs: this one is everything the planner is told and nothing else,
+        # so a bad decision can be read against exactly what informed it.
+        _atomic_write_json(self.run_dir / PLANNER_STATE_FILE, self.planner_state())
         if self.grand_plan is not None:
             _atomic_write_json(self.run_dir / GRAND_PLAN_FILE, self.grand_plan)
 

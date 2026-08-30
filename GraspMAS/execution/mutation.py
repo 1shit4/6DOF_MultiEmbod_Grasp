@@ -187,15 +187,25 @@ class MutationExecutor:
                 grasped = str(self._rng.choice(others))
                 report.grasped_object = grasped
                 report.status = "partial"
-                report.notes.append("injected: the hand closed on a neighbour")
+                # What a real arm would have: it closed on *something* and knows
+                # which, from where the fingers ended up. It does not know that
+                # this was a targeting error rather than the plan.
+                report.notes.append(
+                    f"the hand closed on {grasped}, which is not what the plan named"
+                )
+                report.ground_truth["injected"] = "wrong_object"
 
         if "drop" in self.inject and injecting:
             report.status = "failed"
             report.stage_reached = "lift"
-            report.error = "injected: the object slipped out of the jaw on lift"
+            # Observable: the lift began and the object did not come with it.
+            # Whether that was a slip, too heavy, or a bad grasp is exactly what
+            # the planner should have to work out.
+            report.error = "the object did not move; it was not held at the end of the lift"
+            report.ground_truth["injected"] = "drop"
             report.applied_translation = np.zeros(3)
             report.duration_s = time.time() - t0
-            self.history.append({"plan": plan.describe(), "report": report.describe()})
+            self.history.append({"plan": plan.describe(), "report": report.describe_with_ground_truth()})
             return report
 
         delta_world = self._world_from_camera(plan.translation)
@@ -228,11 +238,12 @@ class MutationExecutor:
             slip[2] = 0.0
             delta_world = delta_world + slip
             report.status = "partial"
+            # A real system knows where it let go, by measuring afterwards. It
+            # does not know *why* the release was off.
             report.notes.append(
-                f"injected: released {np.linalg.norm(slip)*100:.0f} cm "
-                + ("short of" if self.offset_dir == "short" else "off")
-                + " the intended spot"
+                f"released {np.linalg.norm(slip)*100:.0f} cm from the intended spot"
             )
+            report.ground_truth["injected"] = f"offset:{self.offset_dir}"
 
         prim = self.spec.by_name(grasped).primitive
         moved = ss.Primitive(
@@ -251,7 +262,11 @@ class MutationExecutor:
             size[0], size[2] = size[2], size[0]
             moved = ss.Primitive(moved.kind, size, moved.position, moved.yaw, moved.color)
             report.status = "partial"
-            report.notes.append("injected: the object toppled on release")
+            # Observable from the next capture: its height and footprint swapped.
+            report.notes.append(
+                "the object is not standing as it was; its height and footprint have swapped"
+            )
+            report.ground_truth["injected"] = "tip"
 
         moved = moved.resting()
         self.spec = self.spec.replace(grasped, moved)
@@ -271,11 +286,15 @@ class MutationExecutor:
                 )
                 report.disturbed.append(victim)
                 report.status = "partial" if report.status == "ok" else report.status
-                report.notes.append(f"injected: knocked {victim} while moving")
+                # `disturbed` already names it; the note says only what a
+                # camera would show, not that we caused it.
+                report.notes.append(f"{victim} is no longer where it was")
+                report.ground_truth["injected"] = "collateral"
+                report.ground_truth["victim"] = victim
 
         report.applied_translation = delta_world
         report.duration_s = time.time() - t0
-        self.history.append({"plan": plan.describe(), "report": report.describe()})
+        self.history.append({"plan": plan.describe(), "report": report.describe_with_ground_truth()})
         return report
 
 

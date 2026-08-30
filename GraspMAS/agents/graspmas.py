@@ -8,6 +8,7 @@ import numpy as np
 
 import image_patch as image_patch_module
 from agents.prompt import coder_prompt, observer_prompt, planner_prompt
+from collision import gripper_morphology
 from perception3d import Grasp6D, SceneContext, approach_elevation_deg
 from run_artifacts import NullRecorder
 from vis6d import visualize_grasp_6dof, visualize_grasp_candidates
@@ -178,10 +179,6 @@ class GraspMAS:
             out_raw = self._execute(self.code, img_np, idx)
             result = self._build_result(out_raw, img_np, scene, image_path, save_folder, idx)
 
-            if result["grasp"] is not None:
-                grasp_pose = result["grasp"]
-                out = grasp_pose
-
             print("----- Execution Result -----\n", {
                 k: (v if k != "grasp" else self._short_grasp(v)) for k, v in result.items()
             })
@@ -189,7 +186,25 @@ class GraspMAS:
             with self.recorder.stage("observer"):
                 observation = await self.observer(result, query)
             print("----- Observation -----\n", observation)
-            self.observation = observation.get("summary", "")
+
+            # Keep the LATEST grasp the Observer did not reject, not the
+            # best-scoring one. A rejected grasp was rejected for a reason and
+            # the next round exists to fix that reason, so a later grasp
+            # supersedes an earlier one even when it scores lower — the score is
+            # the discriminator's opinion of the grasp in isolation and knows
+            # nothing about the scene or the query.
+            #
+            # An unparseable verdict keeps the grasp: a provider hiccup should
+            # not discard a sound pose. Only an explicit rejection does.
+            if result["grasp"] is not None:
+                if self._keeps_grasp(observation):
+                    grasp_pose = result["grasp"]
+                    out = grasp_pose
+                else:
+                    self.recorder.log(
+                        f"round {idx}: grasp rejected by the Observer, not kept"
+                    )
+            self.observation = self._observation_for_planner(observation)
             # The Observer's verdict and checklist used to be discarded here.
             # The prompt tells the Planner to reason from the summary alone, and
             # that stays true — but the *outer* loop needs a programmatic signal
@@ -217,6 +232,128 @@ class GraspMAS:
         return out, grasp_pose
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _observation_for_planner(observation: dict) -> str:
+        """Render the Observer's judgement for the Planner, in full.
+
+        This used to be `observation.get("summary", "")` — one prose sentence,
+        with the verdict, the failure kind and all five checklist fields thrown
+        away, because the Planner's prompt forbade reading them. The Planner
+        then reconstructed pass/fail from the prose and behaved as a switch,
+        which is roughly all a sentence can carry.
+        """
+        obs = observation or {}
+        lines = []
+        verdict = str(obs.get("verdict", "") or "").upper()
+        if verdict:
+            lines.append(f"VERDICT: {verdict}")
+        failure = str(obs.get("failure", "") or "")
+        if failure and failure != "none":
+            lines.append(f"FAILURE KIND: {failure}")
+
+        checklist = obs.get("checklist")
+        if isinstance(checklist, dict) and checklist:
+            lines.append("CHECKS:")
+            for key, value in checklist.items():
+                lines.append(f"  {key}: {value}")
+
+        errors = obs.get("error_logs")
+        if errors and str(errors).strip().lower() not in ("none", "null"):
+            lines.append(f"ERRORS: {errors}")
+
+        summary = str(obs.get("summary", "") or "").strip()
+        if summary:
+            lines.append(f"SUMMARY: {summary}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _selection_summary(grasp: Optional[dict]) -> Optional[dict]:
+        """The funnel that produced this grasp, in the Observer's terms."""
+        f = (grasp or {}).get("filters") or {}
+        if not f:
+            return None
+        return {
+            "candidates_generated": f.get("n_candidates"),
+            "approaching_from_the_observed_side": f.get("n_visible"),
+            "landing_on_the_requested_region": f.get("n_on_target"),
+            "clear_of_the_rest_of_the_scene": f.get("n_clear_of_scene"),
+            "scene_collision_was_checked": f.get("collision_checked"),
+        }
+
+    @staticmethod
+    def _selection_warnings(grasp: Optional[dict]) -> Optional[str]:
+        """Anything that makes this grasp the least-bad rather than a good one.
+
+        These are the three ways `grasp_detection` returns a pose it is not
+        happy with. Each was a `logger.warning` and nothing more, so the
+        Observer was left to infer from a 2D projection that the approach was
+        fouled — a question Python had already answered exactly.
+        """
+        f = (grasp or {}).get("filters") or {}
+        if not f:
+            return None
+
+        notes = []
+        if f.get("every_candidate_collides"):
+            notes.append(
+                f"COLLISION: all {f.get('n_on_target')} grasps on this object "
+                "put the hand through something else in the scene. The one shown "
+                "is the least bad of them, not a clear one — the constraint was "
+                "dropped to return anything at all."
+            )
+        if f.get("no_candidate_inside_mask"):
+            notes.append(
+                f"OFF-TARGET: none of {f.get('n_visible')} candidates had their "
+                "centre inside the requested region, so they were ranked by score "
+                "alone. The grasp shown may be on the wrong part of the object."
+            )
+        fouled = f.get("fouled_by") or []
+        if fouled:
+            named = ", ".join(
+                f"{e['object_id']} ({e['label']}) fouled {e['grasps_fouled']}"
+                for e in fouled[:3]
+            )
+            notes.append(
+                f"BLOCKED BY: of the best grasps found on this object, these "
+                f"were rejected for colliding with — {named}. These are the "
+                f"objects standing between the hand and a good grasp; say so, "
+                f"because moving them is what would help."
+            )
+        if f.get("part_found") is False:
+            notes.append(
+                "WRONG REGION: the requested part could not be located, so the "
+                "whole object was used instead. This grasp is NOT on the part "
+                "that was asked for."
+            )
+        elif f.get("part_substituted"):
+            notes.append(
+                f"SUBSTITUTED PART: the requested part was not found under that "
+                f"name, but {f.get('part_term')!r} was, and the grasp is on "
+                f"whatever that matched. Check in the image that it is the same "
+                f"region that was asked for — a plausible synonym is not always "
+                f"the same piece of the object."
+            )
+        return "\n".join(notes) if notes else None
+
+    @staticmethod
+    def _keeps_grasp(observation: dict) -> bool:
+        """May this round's grasp stand as the loop's answer?
+
+        Two decisions in one line, and they pull in different directions.
+
+        A grasp the Observer rejected must not be kept, or the loop can finish
+        holding a pose its own critic called unsound and hand it to the
+        executor. That was the old behaviour: every round overwrote the last
+        with no reference to the verdict at all.
+
+        But an *unparseable* verdict must not cost us a sound grasp. The
+        Observer already retries once and then degrades to raw text, and a
+        provider hiccup on the critique is no evidence against the pose. So the
+        rule is "unless explicitly rejected", not "only when explicitly
+        approved".
+        """
+        return str((observation or {}).get("verdict", "")).upper() != "INVALID"
 
     def _execute(self, code: str, img_np: np.ndarray, round_idx: int):
         """Exec the generated `execute_command` and return its result or the error."""
@@ -250,6 +387,10 @@ class GraspMAS:
             "place": None,
             "place_summary": None,
             "image": str(image_path),
+            "selection": None,
+            # Only ever filled in when there was NO grasp, which is how every
+            # warning raised while successfully returning a poor one stayed
+            # invisible. The success path below now populates it too.
             "error_logs": None,
         }
 
@@ -282,11 +423,16 @@ class GraspMAS:
 
         grasp = Grasp6D.from_dict(out_raw)
         K = scene.get_intrinsics(img_np)
+        # The mask is what the Observer's prompt calls "the magenta region …
+        # the exact object or part the grasp was computed for". It was never
+        # passed, so that region was never drawn and the Observer had to guess
+        # which object was aimed at from where the hand landed.
         vis = visualize_grasp_6dof(
             img_np, grasp, K,
             save_folder=self.recorder.images_dir
             if self.recorder.enabled else save_folder,
             filename=f"round{round_idx}_overlay.png",
+            mask=image_patch_module.grasp_mask(out_raw),
         )
         result["grasp"] = out_raw
         result["image"] = str(vis)
@@ -300,7 +446,16 @@ class GraspMAS:
             "approach_deg_off_camera_axis": round(approach_elevation_deg(grasp.approach), 1),
             "jaw_width_cm": round(grasp.width * 100, 1),
             "depth_source": scene.depth_source,
+            # What kind of hand this is. A name string and a jaw width is not
+            # enough to judge "can this close on that" for anything but the one
+            # gripper the Observer has already seen.
+            "gripper_morphology": gripper_morphology(grasp.gripper),
         }
+        # How the winner was chosen, and whether any constraint had to be
+        # dropped to produce one. Both were computed inside `grasp_detection`
+        # and logged to a file nobody reads.
+        result["selection"] = self._selection_summary(out_raw)
+        result["error_logs"] = self._selection_warnings(out_raw)
 
         if place is not None:
             result["place"] = place

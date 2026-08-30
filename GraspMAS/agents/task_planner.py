@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 ACTIONS = ("remove", "grasp_target", "retarget", "abort")
 
+#: Internal only — never emitted by a model, never in `ACTIONS`. Means "that
+#: decision was refused, and the run continues", as opposed to `abort`, which is
+#: terminal.
+#:
+#: This survived a deliberate attempt to delete it. Making every refusal
+#: terminal is tidier and re-creates the §7.12 defect exactly: a planner that
+#: proposes a switch too early — a defensible thing to propose — kills the run.
+#: What changed instead is how rarely it fires. The bar used to be two
+#: iterations of getting nowhere; it is now simply "this run has acted at all",
+#: so the only refusal left is the one that was actually measured: switching at
+#: iteration 0 because the alternative looked easier.
+DEFER = "defer"
+
 #: Below this an instance is too sparse to fit a footprint to, so it cannot be
 #: placed or reasoned about geometrically. Taken from the registry rather than
 #: restated, so the two cannot drift apart. Imported lazily inside the function
@@ -36,16 +49,6 @@ def _min_target_points() -> int:
     from scene_registry import MIN_INSTANCE_POINTS
 
     return MIN_INSTANCE_POINTS
-
-#: Internal only — never emitted by a model, never in `ACTIONS`. Means "that
-#: decision was declined but the run continues", as opposed to `abort`, which is
-#: terminal. Used where a refusal is about *timing* rather than possibility.
-DEFER = "defer"
-
-#: Iterations of getting nowhere before switching target is allowed. Matched to
-#: `declutter.STALL_WINDOW`, because the same evidence that says "this is not
-#: working" is what justifies trying something else.
-MIN_RETARGET_EVIDENCE = 2
 
 #: How many ranked alternatives are worth computing a blocking analysis for.
 #: Each costs a geometric test, not a request, but a longer list only adds
@@ -138,8 +141,8 @@ class Decision:
 
     @property
     def is_deferred(self) -> bool:
-        """Declined, but the run continues — not a model-emitted action."""
-        return self.action == "defer"
+        """Refused, but the run continues — not a model-emitted action."""
+        return self.action == DEFER
 
     def describe(self) -> dict:
         return {
@@ -205,10 +208,16 @@ def format_blocking(blockers, target=None) -> str:
         why = []
         if "occlusion" in b.reasons:
             why.append(f"occlusion ({b.occlusion_frac:.0%} of the target's outline)")
-        if "approach" in b.reasons:
-            why.append(f"approach ({b.sweep_points} points inside the gripper sweep)")
-        if "proximity" in b.reasons:
-            why.append(f"proximity (gap {b.gap_m*100:.1f} cm)")
+        if "fouls_grasp" in b.reasons:
+            why.append(
+                f"blocks the hand ({b.grasps_fouled} of the best grasps on the "
+                "target collide with it)"
+            )
+        if "contact" in b.reasons:
+            why.append(
+                f"touching the target (gap {b.gap_m*100:.1f} cm) — may resist the "
+                "pick, or topple when the target is lifted away"
+            )
         lines.append(f"  {b.object_id} ({b.label}) — {', '.join(why)}")
 
     if target is not None and not target.footprint_is_reliable:
@@ -526,33 +535,32 @@ class TaskPlanner:
             d.action, d.object_id = "abort", None
             return d
 
-        # Switching before the current target has actually resisted anything is
-        # the failure mode this guards: an easier object is not a better answer.
+        # Switching before the run has tried anything is the failure this
+        # guards, and it is a measured one: on `affordance_choice` the model
+        # moved from the knife to the scissors because they were "fully visible
+        # and unobstructed, making them a more efficient and immediate
+        # solution" — that is, because they were easier, which the prompt
+        # forbids. Fetching the wrong thing quickly is a failure, not an
+        # efficiency.
         #
-        # Evidence is counted as *iterations that got nowhere*, not as failed
-        # attempts on the target — a target is usually defeated without ever
-        # being touched, by repeated failures to clear what stands in front of
-        # it, so counting attempts on the target itself would never fire.
-        evidence = max(
-            state.iterations_without_progress(),
-            sum(1 for a in state.attempts_on(target_id) if not a.succeeded),
-        )
-        if evidence < MIN_RETARGET_EVIDENCE:
-            # Premature, not impossible — so decline and let the run continue.
-            # Aborting here punished a planner that reasoned well: measured live
-            # on `affordance_choice`, the model asked to switch after a single
-            # failed attempt ("rather than risk repeated failures on the bottle,
-            # I am switching to the scissors"), which is a defensible thing to
-            # propose and a terrible thing to die for. The refusal is carried
-            # into the next decision instead, and a run that keeps asking still
-            # terminates, because deferred iterations make no progress and stall
-            # detection counts them.
+        # But the bar is "has this run acted at all", not a count of fruitless
+        # iterations. Counting iterations conflated a target that has resisted
+        # effort with one nobody has touched, and it made a *planner reasoning
+        # correctly* wait: asked to switch after one honest failure, with sound
+        # reasons, it used to be refused. Trusting the planner once it has
+        # evidence is the point; the guard only stops it choosing on comfort.
+        if not state.has_acted():
+            # Refused, not fatal. Proposing a switch early is a reasonable thing
+            # for a planner to do; dying for it is not, and §7.12 records a run
+            # that did exactly that. The iteration proceeds with the current
+            # target instead — which both makes progress and produces the
+            # evidence that would justify asking again.
             d.corrections.append(
-                f"retarget declined: only {evidence} iteration(s) of evidence "
-                f"against {target_id}, and {MIN_RETARGET_EVIDENCE} are needed. "
-                "Continuing with the current target"
+                f"retarget refused: nothing has been attempted yet, so there is "
+                f"no evidence against {target_id} — an easier target is not a "
+                f"better one. Continuing with the current target"
             )
-            d.action, d.object_id = "defer", None
+            d.action, d.object_id = DEFER, None
             return d
 
         wanted = d.object_id

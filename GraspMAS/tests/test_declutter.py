@@ -404,11 +404,39 @@ class TestInnerLoopInstruction:
 
     def test_instruction_falls_back_to_the_label(self):
         inst = SimpleNamespace(id="obj_007", label="mug", descriptor=None)
-        assert DeclutterLoop._instruction(inst) == "obj_007 (mug)"
+        text = DeclutterLoop._instruction(inst)
+        assert "obj_007" in text
+        assert "mug" in text
 
     def test_instruction_is_just_the_id_when_nothing_else_is_known(self):
         inst = SimpleNamespace(id="obj_009", label="", descriptor="")
-        assert DeclutterLoop._instruction(inst) == "obj_009"
+        assert "obj_009" in DeclutterLoop._instruction(inst)
+
+    def test_declutter_phase_asks_for_a_secure_hold(self):
+        """Moving a knife aside wants the handle, and says so."""
+        inst = SimpleNamespace(id="obj_004", label="knife", descriptor=None)
+        text = DeclutterLoop._instruction(inst, "declutter", "i need something to cut")
+        assert "obj_004" in text
+        assert "out of the way" in text
+        assert "handle" in text
+        # The person's words must NOT govern a hold on an object being shifted.
+        assert "i need something to cut" not in text
+
+    def test_deliver_phase_carries_the_person_s_words(self):
+        """Handing the knife over is governed by what was asked, not by a rule."""
+        inst = SimpleNamespace(id="obj_004", label="knife", descriptor=None)
+        text = DeclutterLoop._instruction(inst, "deliver", "hand me something to cut with")
+        assert "obj_004" in text
+        assert "hand me something to cut with" in text
+        assert "out of the way" not in text
+
+    def test_the_two_phases_differ(self):
+        """The whole point: same object, materially different instruction."""
+        inst = SimpleNamespace(id="obj_004", label="knife", descriptor=None)
+        assert (
+            DeclutterLoop._instruction(inst, "declutter", "g")
+            != DeclutterLoop._instruction(inst, "deliver", "g")
+        )
 
     @pytest.mark.asyncio
     async def test_the_loop_asks_the_agents_for_an_id(self, tmp_path, tabletop):
@@ -439,7 +467,10 @@ class TestInnerLoopInstruction:
         await loop.run("pick up the banana", "banana")
 
         assert asked, "the inner loop was never consulted"
-        assert all(q.startswith("obj_") for q in asked), asked
+        # The durable invariant is that the id *reaches* the Coder, not that it
+        # is the first token: the instruction also has to say why the object is
+        # being picked up, since that decides which part to take.
+        assert all("obj_" in q for q in asked), asked
 
 
 class TestArtifactScoping:
@@ -693,7 +724,11 @@ class TestRecoversFromAOneShotFault:
         first = state.iterations[0]
         assert first.evaluation["action_succeeded"] == "not_moved"
         assert first.evaluation["still_blocking_target"] is True
-        assert "slipped" in (first.execution.get("error") or "")
+        # The failure is described by what a sensor could observe — the lift
+        # ran and the object stayed put — not by naming the injected fault.
+        assert first.execution.get("stage_reached") == "lift"
+        assert "did not move" in (first.execution.get("error") or "")
+        assert "injected" not in (first.execution.get("error") or "")
         # And the very next attempt on the same object worked.
         second = state.iterations[1]
         assert second.object_id == first.object_id
@@ -910,17 +945,23 @@ class _FakeAttempt:
 class _FakeState:
     """Just enough SessionState for the retarget gate."""
 
-    def __init__(self, candidates=(), used=0, failures=0, limit=1):
+    def __init__(self, candidates=(), used=0, failures=0, limit=1, acted=None):
         self.target_candidates = list(candidates)
         self.retargets_used = used
         self._failures = failures
         self._limit = limit
+        # Defaults to "the run has done something" when failures were recorded,
+        # so existing cases read the same way they always did.
+        self._acted = bool(failures) if acted is None else acted
 
     def can_retarget(self):
         return self.retargets_used < self._limit
 
     def attempts_on(self, oid):
         return []
+
+    def has_acted(self):
+        return self._acted
 
     def iterations_without_progress(self):
         return self._failures
@@ -949,18 +990,34 @@ class TestRetargetGate:
         out = TaskPlanner.validate(self._decide(), self._reg(), "obj_001", state)
         assert out.action == "retarget" and out.object_id == "obj_002"
 
-    def test_a_premature_retarget_is_declined_not_fatal(self):
-        """Proposing it early is defensible; dying for it is not.
+    def test_one_honest_attempt_is_enough(self):
+        """A planner reasoning correctly should not have to wait.
 
-        Measured live: the model asked to switch after one failed attempt, with
-        a sound explanation, and the run ended. Refusals about *timing* now
-        defer; only structural impossibility aborts.
+        The gate used to demand two iterations of getting nowhere, which made a
+        model that asked to switch after one honest failure — with sound
+        reasons — wait for a second. Evidence is now "this run has actually
+        tried something", which is the distinction that matters: a target that
+        resisted effort against one nobody has touched.
         """
-        state = _FakeState(candidates=["obj_001", "obj_002"], failures=1)
+        state = _FakeState(candidates=["obj_001", "obj_002"], failures=1, acted=True)
         out = TaskPlanner.validate(self._decide(), self._reg(), "obj_001", state)
-        assert out.action == "defer" and out.is_deferred
+        assert out.action == "retarget" and out.object_id == "obj_002"
+
+    def test_switching_before_trying_anything_is_refused(self):
+        """The measured failure: choosing the easier target at iteration 0.
+
+        On `affordance_choice` the model left the knife for the scissors because
+        they were "fully visible and unobstructed, making them a more efficient
+        and immediate solution" — because they were easier. Fetching the wrong
+        thing quickly is a failure, not an efficiency.
+        """
+        state = _FakeState(candidates=["obj_001", "obj_002"], failures=0, acted=False)
+        out = TaskPlanner.validate(self._decide(), self._reg(), "obj_001", state)
+        # Refused, not fatal — §7.12 records a run that died on exactly this.
+        assert out.is_deferred
         assert not out.is_terminal
-        assert any("declined" in c for c in out.corrections)
+        assert out.object_id is None
+        assert any("nothing has been attempted" in c for c in out.corrections)
 
     def test_structural_refusals_still_abort(self):
         """No alternatives and a spent budget are not matters of timing."""
@@ -1325,7 +1382,7 @@ class TestDeclinedRetargetDoesRealWork:
     def test_the_refusal_is_still_recorded(self):
         _, state, _ = self._run()
         notes = " ".join(state.iterations[0].notes)
-        assert "declined" in notes
+        assert "refused" in notes
         assert "falling back to the geometric choice" in notes
 
     def test_the_run_still_terminates(self):
@@ -1373,3 +1430,184 @@ class TestDeclineIsNotEvidence:
         self._record(st, 1, "remove",
                      {"still_blocking_target": False, "target_blockers": []})
         assert st.iterations_without_progress() == 0
+
+
+class TestRejectedGraspIsNotSubstituted:
+    """A grasp the critic rejected must not be quietly replaced by a geometric one.
+
+    Measured live: a run reported `success` carrying `score: 0.0,
+    source: "nominal"` because the Observer rejected every round on the target
+    and `_grasp_for` fell straight through to the nominal grasp. The critic's
+    judgement was overridden without a word.
+
+    The distinction that matters is *why* the inner loop came back empty. An
+    outage or a code error is not a judgement, and falling back there is what
+    the §7.11 guard is for. A rejection is a judgement.
+    """
+
+    class _Loop:
+        """Just enough DeclutterLoop to exercise the branch."""
+
+        def __init__(self, review):
+            from types import SimpleNamespace
+
+            self.graspmas = SimpleNamespace(observation_json=review)
+            self._last_grasp_refusal = None
+            self.notes = []
+
+        def note(self, msg):
+            self.notes.append(msg)
+
+    @staticmethod
+    def _refuses(review, phase):
+        """Mirror of the branch in `_grasp_for`: does this block the fallback?"""
+        why = str((review or {}).get("failure") or "unspecified")
+        return str((review or {}).get("verdict", "")).upper() == "INVALID" and (
+            phase == "deliver" or why in ("geometry", "wrong_object")
+        )
+
+    def test_a_collision_blocks_the_fallback_in_both_phases(self):
+        bad = {"verdict": "INVALID", "failure": "geometry"}
+        assert self._refuses(bad, "declutter")
+        assert self._refuses(bad, "deliver")
+
+    def test_grasping_the_wrong_object_blocks_it_too(self):
+        bad = {"verdict": "INVALID", "failure": "wrong_object"}
+        assert self._refuses(bad, "declutter")
+        assert self._refuses(bad, "deliver")
+
+    def test_wrong_part_does_not_block_a_declutter_move(self):
+        """The regression this caught, and why the phase matters.
+
+        Moving an object aside only needs the object to move. A sound grasp
+        anywhere on it does that, whatever sub-region was named — and on a
+        synthetic scene an object has no parts at all, so `find_part` correctly
+        finds none and the Observer correctly says `wrong_part`. Blocking here
+        made the loop refuse a grasp it had itself called "physically feasible
+        and collision-free", and every clean run aborted.
+        """
+        soft = {"verdict": "INVALID", "failure": "wrong_part"}
+        assert not self._refuses(soft, "declutter")
+
+    def test_wrong_part_does_block_a_handover(self):
+        """How the object is held IS the request when it is being handed over."""
+        soft = {"verdict": "INVALID", "failure": "wrong_part"}
+        assert self._refuses(soft, "deliver")
+
+    def test_an_outage_still_falls_back(self):
+        """The §7.11 guard: an unreachable provider is not a verdict."""
+        assert not self._refuses({}, "declutter")
+        assert not self._refuses({}, "deliver")
+
+    def test_a_valid_verdict_is_not_a_refusal(self):
+        ok = {"verdict": "VALID", "failure": "none"}
+        assert not self._refuses(ok, "declutter")
+        assert not self._refuses(ok, "deliver")
+
+    def test_the_refusal_is_consumed_once(self, tmp_path):
+        """A stale reason must not be attributed to a later iteration."""
+        from session_state import SessionState
+
+        executor = MutationExecutor(ss.occluded_target_scene(), seed=0)
+        loop = DeclutterLoop(
+            executor=executor, state=SessionState(tmp_path / "r"), max_iterations=2
+        )
+        loop._last_grasp_refusal = "because reasons"
+        assert loop._take_grasp_refusal() == "because reasons"
+        assert loop._take_grasp_refusal() is None
+
+
+class TestBlockersAreOnlyWhatMustMove:
+    """Two measured reasons, plus what a real grasp attempt found in the way.
+
+    The two deleted tests answered questions they could not answer. *approach*
+    swept one **synthesised top-down** pose — one direction out of the many a
+    real grasp can come from — and across every recorded run it fired **zero**
+    times. *proximity* flagged anything within half the width of the whole hand
+    (10.4 cm on a Panda) on the assumption the hand must fit broadside, which it
+    need not, and it disagreed with placement's 3 cm margin so an object could
+    be legally set down and instantly re-flagged.
+    """
+
+    def _loop(self, tmp_path):
+        from session_state import SessionState
+
+        ex = MutationExecutor(ss.occluded_target_scene(), seed=0)
+        loop = DeclutterLoop(
+            executor=ex, state=SessionState(tmp_path / "r"), max_iterations=6
+        )
+        loop._perceive(0)
+        return loop
+
+    def test_no_grasp_blockers_before_a_grasp_is_tried(self, tmp_path):
+        """The third source of blockers only exists once something was tried."""
+        assert self._loop(tmp_path)._grasp_blockers == []
+
+    def test_occluders_are_flagged(self, tmp_path):
+        loop = self._loop(tmp_path)
+        target = min(loop.registry.instances.values(), key=lambda i: i.visibility)
+        blockers = loop._blockers_for(target.id)
+        assert blockers
+        assert all("occlusion" in b.reasons for b in blockers)
+
+    def test_no_approach_or_proximity_reasons_survive(self, tmp_path):
+        loop = self._loop(tmp_path)
+        for inst in loop.registry.instances.values():
+            for b in loop._blockers_for(inst.id):
+                assert "approach" not in b.reasons
+                assert "proximity" not in b.reasons
+                assert set(b.reasons) <= {"occlusion", "contact", "fouls_grasp"}
+
+    def test_grasp_blockers_are_merged_in(self, tmp_path):
+        """What the collision filter named becomes a blocker the planner sees."""
+        loop = self._loop(tmp_path)
+        ids = sorted(loop.registry.instances)
+        target, other = ids[0], ids[1]
+        loop._grasp_blockers = [
+            {"object_id": other, "label": "x", "grasps_fouled": 7}
+        ]
+        got = {b.object_id: b for b in loop._blockers_for(target)}
+        assert other in got
+        assert "fouls_grasp" in got[other].reasons
+        assert got[other].grasps_fouled == 7
+
+    def test_the_target_can_never_be_its_own_blocker(self, tmp_path):
+        loop = self._loop(tmp_path)
+        target = sorted(loop.registry.instances)[0]
+        loop._grasp_blockers = [
+            {"object_id": target, "label": "self", "grasps_fouled": 5}
+        ]
+        assert target not in [b.object_id for b in loop._blockers_for(target)]
+
+    def test_a_vanished_object_is_ignored(self, tmp_path):
+        """Objects are re-identified every iteration; a stale id must not crash."""
+        loop = self._loop(tmp_path)
+        target = sorted(loop.registry.instances)[0]
+        loop._grasp_blockers = [
+            {"object_id": "obj_gone", "label": "?", "grasps_fouled": 3}
+        ]
+        assert "obj_gone" not in [b.object_id for b in loop._blockers_for(target)]
+
+
+class TestGraspBlockerCollection:
+    """Merging what each inner round's collision filter attributed."""
+
+    def test_counts_accumulate_across_rounds(self):
+        rounds = [
+            {"grasp": {"filters": {"fouled_by": [
+                {"object_id": "obj_2", "label": "box", "grasps_fouled": 3}]}}},
+            {"grasp": {"filters": {"fouled_by": [
+                {"object_id": "obj_2", "label": "box", "grasps_fouled": 4},
+                {"object_id": "obj_3", "label": "mug", "grasps_fouled": 1}]}}},
+        ]
+        got = DeclutterLoop._grasp_blockers_from_rounds(rounds)
+        assert got[0] == {"object_id": "obj_2", "label": "box", "grasps_fouled": 7}
+        assert [e["object_id"] for e in got] == ["obj_2", "obj_3"]  # worst first
+
+    def test_rounds_without_a_grasp_are_skipped(self):
+        assert DeclutterLoop._grasp_blockers_from_rounds(
+            [{"plan": "x"}, {"grasp": None}]
+        ) == []
+
+    def test_no_rounds_is_empty(self):
+        assert DeclutterLoop._grasp_blockers_from_rounds(None) == []

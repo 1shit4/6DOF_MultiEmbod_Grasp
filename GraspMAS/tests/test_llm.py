@@ -524,3 +524,84 @@ class TestSingleKeyIsUnchanged:
         assert len(slept) == 2, f"expected two waits, got {slept}"
         assert slept[1] > slept[0]
         assert max(slept) < 1.0
+
+
+class TestTransportErrorsRetry:
+    """A dropped socket must not end a manipulation run.
+
+    `openai` raises `APIConnectionError` whose message is the entirely
+    unsearchable string "Connection error." — no status code, no keyword. It
+    matched none of the retry patterns, so the call failed on attempt 1 of 5,
+    the provider was marked failed, and the run died. Measured over one session:
+    17 such failures aborted four runs and emptied two others' agent records,
+    every one of them a transient blip on a network that probed 3/3 healthy
+    seconds later.
+    """
+
+    def _types(self):
+        import httpx
+        import openai
+
+        return httpx, openai
+
+    def test_openai_connection_error_retries(self):
+        import httpx
+        import openai
+
+        from agents.llm import ChatLLM
+
+        exc = openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
+        assert ChatLLM._is_retryable(exc)
+
+    def test_httpx_transport_errors_retry(self):
+        import httpx
+
+        from agents.llm import ChatLLM
+
+        for exc in (
+            httpx.ConnectError("boom"),
+            httpx.ReadError("boom"),
+            httpx.ReadTimeout("boom"),
+            httpx.RemoteProtocolError("boom"),
+        ):
+            assert ChatLLM._is_retryable(exc), type(exc).__name__
+
+    def test_a_builtin_connection_error_retries(self):
+        from agents.llm import ChatLLM
+
+        assert ChatLLM._is_retryable(ConnectionError("connection reset by peer"))
+
+    def test_the_bare_string_form_retries(self):
+        """For transport errors that lose their type being re-raised."""
+        from agents.llm import ChatLLM
+
+        for text in (
+            "Connection error.", "connection reset", "Server disconnected",
+            "broken pipe", "SSL: WRONG_VERSION_NUMBER",
+        ):
+            assert ChatLLM._is_retryable(Exception(text)), text
+
+    def test_rate_limits_still_retry(self):
+        from agents.llm import ChatLLM
+
+        assert ChatLLM._is_retryable(Exception("rate limit exceeded"))
+        assert ChatLLM._is_retryable(Exception("503 Service Unavailable"))
+
+    def test_real_bugs_still_fail_fast(self):
+        """Retrying a bad argument five times just delays the traceback."""
+        from agents.llm import ChatLLM
+
+        assert not ChatLLM._is_retryable(ValueError("bad argument"))
+        assert not ChatLLM._is_retryable(KeyError("missing"))
+        assert not ChatLLM._is_retryable(Exception("invalid api key"))
+
+    def test_missing_optional_deps_do_not_break_classification(self, monkeypatch):
+        """The type list is best-effort; the string fallback must still work."""
+        from agents.llm import ChatLLM
+
+        monkeypatch.setattr(ChatLLM, "_TRANSPORT_ERRORS", (), raising=False)
+        monkeypatch.setattr(
+            "builtins.__import__",
+            lambda *a, **k: (_ for _ in ()).throw(ImportError("nope")),
+        )
+        assert ChatLLM._is_retryable(Exception("Connection error."))

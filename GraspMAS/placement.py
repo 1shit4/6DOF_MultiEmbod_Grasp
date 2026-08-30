@@ -61,6 +61,29 @@ DEFAULT_CLEARANCE_M = 0.01
 DEFAULT_MARGIN_M = 0.03
 
 
+def gripper_clearance_m(gripper_name: str) -> float:
+    """Space to leave around a placed object, for the hand that must reach it.
+
+    `DEFAULT_MARGIN_M` corrects the footprint bias; it says nothing about the
+    hand. But a placement is only useful if the gripper can get to the object
+    afterwards, and the room needed for that is a property of the gripper —
+    measured as the half-width of its own surface geometry.
+
+    Falls back to `DEFAULT_MARGIN_M` when the descriptions are not installed,
+    which keeps every offline test and the no-asset path behaving as before.
+    """
+    try:
+        import numpy as _np
+
+        import collision as _col
+
+        pts = _col.load_gripper_points(gripper_name)
+        half_width = float(_np.abs(pts[:, 0]).max())
+    except Exception:
+        return DEFAULT_MARGIN_M
+    return max(DEFAULT_MARGIN_M, half_width + DEFAULT_MARGIN_M)
+
+
 # ---------------------------------------------------------------------------
 # Support plane
 # ---------------------------------------------------------------------------
@@ -963,7 +986,7 @@ def plan_place(
     keep_out: Optional[np.ndarray] = None,
     hmap: Optional[HeightMap] = None,
     clearance_m: float = DEFAULT_CLEARANCE_M,
-    margin_m: float = DEFAULT_MARGIN_M,
+    margin_m: Optional[float] = None,
     release_gap_m: float = 0.005,
     workspace: Optional[Tuple[np.ndarray, float]] = None,
     lift_m: float = 0.12,
@@ -975,20 +998,53 @@ def plan_place(
     This is the one function callers normally need; everything above is exposed
     so the individual steps stay testable and so `scene_registry` can reuse the
     plane and the height map it has already built.
+
+    `margin_m` defaults to a **gripper-derived** clearance rather than a
+    constant. Setting an object down 3 cm from its neighbour is legal by the old
+    rule and useless in practice: the hand needs room to get in afterwards, and
+    how much room depends entirely on which hand it is — 7.4 cm for a Robotiq,
+    16.6 cm for a Barrett. A fixed number either wastes table space for small
+    hands or leaves big ones unable to reach what it just put down.
+
+    The consequence is real and worth stating: on a crowded table a large hand
+    may now find nowhere legal to put anything. That returns None, which the
+    caller reports honestly, and is the right failure — better than a placement
+    that has to be undone.
     """
     footprint = object_footprint(object_cloud, plane)
     if hmap is None:
         hmap = build_height_map(scene_cloud, plane, cell_m=cell_m)
 
-    placement = find_placement(
-        hmap,
-        footprint,
-        keep_out=keep_out,
-        prefer_near_xy=footprint.centroid_xy,
-        clearance_m=clearance_m,
-        margin_m=margin_m,
-        workspace=workspace,
-    )
+    # Ask for enough room that the hand can come back for it, then settle for
+    # enough room that it is safely down. Preference, not requirement: a
+    # Franka wants 13.4 cm of clearance and a Barrett 19.6 cm, which on a
+    # cluttered table is often nowhere at all — and refusing to put an object
+    # down because the *next* grasp might be awkward is the wrong trade. If the
+    # tighter placement does foul a later grasp, the collision filter names it
+    # and the loop moves it again, which costs one iteration instead of
+    # deadlocking the run.
+    attempts = [gripper_clearance_m(gripper)] if margin_m is None else [margin_m]
+    if margin_m is None and attempts[0] > DEFAULT_MARGIN_M:
+        attempts.append(DEFAULT_MARGIN_M)
+
+    placement = None
+    for i, want in enumerate(attempts):
+        placement = find_placement(
+            hmap,
+            footprint,
+            keep_out=keep_out,
+            prefer_near_xy=footprint.centroid_xy,
+            clearance_m=clearance_m,
+            margin_m=want,
+            workspace=workspace,
+        )
+        if placement is not None:
+            if i:
+                logger.info(
+                    "plan_place: no spot with %.1f cm of gripper clearance; "
+                    "placed with %.1f cm instead", attempts[0] * 100, want * 100,
+                )
+            break
     if placement is None:
         return None
 

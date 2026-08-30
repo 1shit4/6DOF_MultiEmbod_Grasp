@@ -428,8 +428,41 @@ class ChatLLM:
             out.pop(key, None)
         return {k: v for k, v in out.items() if v is not None}
 
-    @staticmethod
-    def _is_retryable(exc: Exception) -> bool:
+    #: Transport failures that say nothing about the request. Matched by type
+    #: first, because the message for the commonest of them is the entirely
+    #: unsearchable string "Connection error." — no status code, no keyword.
+    #: Leaving it unclassified made every transient blip fatal: the call failed
+    #: on attempt 1 of 5, the provider was marked failed, and a run doing
+    #: manipulation died on a dropped socket. Measured over one session: 17
+    #: such failures aborted four runs and emptied two others' records.
+    _TRANSPORT_ERRORS: tuple = ()
+
+    @classmethod
+    def _transport_error_types(cls) -> tuple:
+        if cls._TRANSPORT_ERRORS:
+            return cls._TRANSPORT_ERRORS
+        types: list = []
+        for mod, names in (
+            ("openai", ("APIConnectionError", "APITimeoutError")),
+            ("httpx", ("ConnectError", "ReadError", "ReadTimeout", "WriteError",
+                       "RemoteProtocolError", "ConnectTimeout", "PoolTimeout")),
+        ):
+            try:
+                m = __import__(mod)
+                for n in names:
+                    t = getattr(m, n, None)
+                    if isinstance(t, type) and issubclass(t, BaseException):
+                        types.append(t)
+            except Exception:  # a missing optional dep must not break retrying
+                continue
+        types.append(ConnectionError)  # builtin, covers os-level resets
+        cls._TRANSPORT_ERRORS = tuple(types)
+        return cls._TRANSPORT_ERRORS
+
+    @classmethod
+    def _is_retryable(cls, exc: Exception) -> bool:
+        if isinstance(exc, cls._transport_error_types()):
+            return True
         status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
         if status in (408, 409, 425, 429, 500, 502, 503, 504):
             return True
@@ -437,7 +470,12 @@ class ChatLLM:
         return any(
             s in text
             for s in ("rate limit", "429", "quota", "timeout", "temporarily",
-                      "overloaded", "unavailable", "503", "500")
+                      "overloaded", "unavailable", "503", "500",
+                      # The string form, for wrapped or re-raised transport
+                      # errors that lose their type on the way up.
+                      "connection error", "connection reset", "connection aborted",
+                      "connection refused", "broken pipe", "server disconnected",
+                      "eof occurred", "ssl")
         )
 
     @staticmethod

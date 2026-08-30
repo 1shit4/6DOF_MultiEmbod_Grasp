@@ -127,6 +127,13 @@ class ExecutionReport:
     notes: List[str] = field(default_factory=list)
     duration_s: float = 0.0
     backend: str = ""
+    #: Why this outcome happened, when the backend happens to know. A real arm
+    #: never does — it reports where the hand got to and what moved, not the
+    #: cause. So this is written by simulated backends for **our** analysis and
+    #: is deliberately excluded from `describe()`, which is what the loop and
+    #: the planner see. A planner told "the object slipped out of the jaw on
+    #: lift" is not inferring anything; it is reading the answer key.
+    ground_truth: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.status not in STATUSES:
@@ -153,7 +160,16 @@ class ExecutionReport:
             "notes": list(self.notes),
             "duration_s": round(self.duration_s, 3),
             "backend": self.backend,
+            # `ground_truth` is intentionally absent. See the field's comment.
         }
+
+    def describe_with_ground_truth(self) -> dict:
+        """`describe()` plus the cause, for the analysis log only.
+
+        Never feed this to an agent: it is the difference between measuring
+        whether the loop can infer a failure and measuring whether it can read.
+        """
+        return {**self.describe(), "ground_truth": dict(self.ground_truth)}
 
 
 @runtime_checkable

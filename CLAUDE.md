@@ -276,6 +276,386 @@ Found during the pre-implementation audit of both repos. Each cost real time to 
 * `timm` is a hard runtime dependency of `vlpart/swintransformer.py` but is absent from
   `requirements.txt`.
 
+### The picture the Observer judges from (found session 8)
+
+Four defects, all in the same place, all invisible in any exit status: the Observer was asked to
+judge a hand that was drawn wrong, against a region that was never drawn at all.
+
+* **`fingertip_depth` defaulted to a constant 0.11 m for every gripper.** Both
+  `visualize_grasp_6dof` call sites in `agents/graspmas.py` omitted it. Real values:
+  franka_panda **0.1034**, robotiq_2f_85 **0.136**, inspire_hand **0.164** — so the yellow fingertip
+  line landed 3-6 cm from where the hand actually closes, and 0.11 is not even the Franka's number.
+  That line is precisely what the prompt tells the Observer the object should sit between.
+* **The mask was never passed**, so the "magenta region … the exact object or part the grasp was
+  computed for" that the prompt describes did not exist. The Observer inferred the target from where
+  the hand landed. The mask lives in `grasp_detection` and the result dict had no route back to it —
+  now `result["mask_key"]`, resolved by `image_patch.grasp_mask()`. Keyed by a monotonic int, not by
+  "the last mask seen": generated code routinely computes an object grasp *and* a part grasp in one
+  round, so last-seen is wrong whenever it returns the earlier one.
+* **Every gripper was drawn as a two-finger sketch.** Four shipped grippers are `revolute_3f`
+  (barrett, inspire, unitree_g1, robotiq_3f) and the prompt says "the orange lines are the two
+  fingers". `vis6d._gripper_silhouette` now traces the real 10,500-point surface `collision.py` had
+  been loading all along. Traced from a **rasterised point cloud, not a convex hull** — the hull
+  fills in the jaw opening, which is the one part of the picture the Observer is asked to read
+  (measured hull/real area: panda **1.29**, barrett **1.50**, and barrett correctly yields 2 contours).
+* **Measuring the fingertips from the point cloud is worse than assuming them.** The extremes of the
+  surface within a slab at fingertip depth give the outer edge of the finger *bodies* — 11.7 cm on a
+  Panda whose jaw opens 8 cm, and 33 cm across the palm of a Barrett. The wireframe span was always
+  right; only its depth was wrong. Tried, measured, deleted.
+
+`collision.gripper_config` / `gripper_geometry` is now the single reader of `config.json`. Three
+subsystems opened it three ways, which is exactly how the overlay came to use 0.11 while the mask
+filter used the real number.
+
+### What each agent is allowed to know (session 8, phase 2)
+
+The channels between stages were narrower than the information available, everywhere.
+
+* **`error_logs` was only ever populated when there was NO grasp.** On the success path it stayed
+  `None`, so every warning raised while returning a *poor* grasp was invisible. Three constraints can
+  be silently dropped to return something rather than nothing — all candidates collide, none landed
+  inside the mask, the requested part was not found — and each makes the winner the least bad of a
+  bad set rather than a good one. One of those fallbacks carries the comment *"keeping them so the
+  Observer can see why"*; the Observer was never told. Now `result["selection"]` (the funnel:
+  `416 → 47 visible → 29 on target → 12 clear`) and `result["error_logs"]` (COLLISION / OFF-TARGET /
+  WRONG REGION).
+* **The Observer's decision rule ignored two of its own five checks.** `target_match` and
+  `collision_risk` were absent from it, so the model filled them in and they could not change the
+  verdict. Both are now in the rule.
+* **The Planner was forbidden from reading any of it.** Prompt rule 2 said *"Base your next subgoals
+  on the Observer summary only. Do not directly read verdict, checklist, or JSON"*, and
+  `graspmas.py` enforced it by passing `observation.get("summary", "")`. It now receives the whole
+  judgement, rendered by `_observation_for_planner`.
+* **A three-way failure taxonomy, because the three have different owners.** `geometry` and
+  `wrong_part` the inner loop can fix by re-planning; `wrong_object` it *cannot*, since the instance
+  id is chosen by the outer task planner before the inner loop starts. Telling the Planner to
+  "diversify" on a wrong-object failure invites it to grasp something nobody asked for. It is now
+  told to return upward instead.
+* **`record_observer` was gated on the grasp succeeding**, which threw the failure kind away exactly
+  when it was most informative — including every `wrong_object`, which by construction produces no
+  usable grasp.
+* **The planner's history now carries how hard the grasp was, but only when the iteration failed.**
+  A clean move needs no explanation and prompt space is not free. Without it the planner could not
+  separate "the grasp was sound and the hand slipped" from "we never found a sound grasp on this
+  thing" — opposite responses, identical rendering.
+
+**Collision attribution** (`SceneRegistry.colliding_instances`). `scene_cloud_excluding` flattens the
+scene into an anonymous point array, so the filter knew a grasp was fouled and never by what.
+Recovered by testing each instance's own cloud, worst first, and only when something has already
+gone wrong. Measured on `occluded_target` with the hand driven onto each object: box names **only
+itself** (it is isolated), mug names **mug 1019, bottle 479, banana 124**. If everything named
+everything the measure would be worthless.
+
+* **Gotcha: `points_inside_sweep` measures proximity to the hand's *surface*, not containment.** A
+  correct grasp deliberately does not touch what it holds — an open Panda jaw clears the banana by
+  **2.4 cm** — so the object being grasped registers **zero**. That is what makes it a collision test.
+  A first attempt at testing attribution asserted "the grasped object is always inside the hand" and
+  was simply wrong about the physics.
+
+* **A run launched without `scripts/env.sh` silently loses the gripper descriptions**, and that now
+  costs far more than it used to. `GRASPGENX_GRIPPER_CFG_DIR` unset means `load_gripper_points` falls
+  back to a box hull, `gripper_geometry` to Franka-like constants and `gripper_morphology` to
+  `"unknown"` — so the overlay reverts to the old two-finger sketch at the wrong depth and the
+  Observer is handed a hand that does not exist, which is exactly the defect phase 1 removed. The
+  only sign is one `WARNING collision: no gripper geometry for 'franka_panda'` in a busy log. Source
+  `scripts/env.sh` (or pass the vars explicitly) for **every** run, not just for tests.
+
+**Blocker-of-a-blocker** (`DeclutterLoop._diagnose_obstruction`). `blocking_objects` was only ever
+called on the *target*, so a chain — B blocks A, A blocks the target — left B invisible: nothing ever
+asked what stood in A's way, and the run just failed to grasp A repeatedly. Now one level deep, and
+**gated on a geometric fact rather than a model's opinion**: it runs only when a specific object is
+measurably inside the hand's swept volume. A grasp that failed because the object is wider than the
+jaw, or because the hand slipped, produces no attribution and no cascade — those are not fixed by
+moving anything. One level, deliberately; recursing further turns a stuck run into a tour of the table.
+
+### What VLPart can and cannot do (measured, session 8)
+
+Every `find_part` failure the loop had been reacting to turned out to be the object genuinely not
+having that part — synthetic primitives have none at all, and the "mug" in `real_world/00` is a
+handle-less yellow cup. VLPart is **open-vocabulary** (`get_text_embeddings` encodes arbitrary text),
+so there is no fixed part list to look up; the question is only what a phrasing scores.
+
+Measured on the mustard bottle in `real_world/00`, threshold **0.30**:
+
+| prompt | best score | |
+|---|---|---|
+| `bottle cap` | **0.590** | pass |
+| `bottle neck` | **0.320** | pass, borderline |
+| `bottle lid` | 0.058 | fail |
+| `bottle top` | 0.068 | fail |
+| `cap` (bare) | 0.003 | fail |
+| `the cap of the bottle` | 0.062 | fail |
+
+Two things follow, and both matter for any fix:
+
+* **The `"{object} {part}"` two-word format is load-bearing.** A bare part name scores ~0.001-0.008
+  and a natural-language phrase ~0.06. `find_part` builds this format already; do not "improve" it
+  into a sentence.
+* **Within that format, wording swings the score by 10x.** `cap` 0.59 against `lid` 0.058 for the
+  same physical feature — not a marginal miss, a different region of embedding space. So a failed
+  lookup is often a naming problem, not an absent part, and **retrying with alternative names is the
+  fix**. Where those names come from matters: a hardcoded synonym table is the same over-fitting
+  trap as an object-specific prompt rule.
+
+Working parts on that scene, for reference: bottle `cap`/`body`/`label`, box `lid`/`side`.
+
+**The bounded retry, and why the Observer is load-bearing.** `find_part` now tries the requested word,
+and only if that finds nothing asks the model (via `llm_query` — the tool exists for exactly this)
+for at most **two** alternative names for the same region. Two, not "until something matches": a
+wider search is slower, spends requests, and mostly raises the chance that a word matching *some*
+region is accepted as the region that was asked for.
+
+Measured on the same bottle:
+
+| asked | matched | substituted | region | scores |
+|---|---|---|---|---|
+| `cap` | `cap` | no | 40% | cap 0.321 |
+| `lid` | **`cap`** | yes | 40% | lid 0.094, cap 0.321 |
+| `top` | — | no | falls back cleanly | top 0.103 |
+| `wing` | **`shoulder`** | yes | 23% | wing 0.084, shoulder 0.302 |
+
+Row 2 is the point of the feature. **Row 4 is the hazard**: a bottle has no wing, the model offered
+"shoulder" (a real bottle part), and it matched — a confident answer to an impossible question.
+
+And the two are **0.019 apart** (0.321 against 0.302), so **no threshold separates them.** Raising
+the bar for substitutions loses the legitimate `lid → cap` recovery before it rejects the bogus
+`wing → shoulder` one. That is why the substitution is *reported* rather than trusted:
+`part_substituted` and `part_term` reach the Observer as a **SUBSTITUTED PART** note, and its prompt
+tells it to look at the magenta region and decide whether it is the region the query asked for.
+A plausible synonym is not always the same piece of an object — "grip" and "handle" coincide on a
+mug and not on a pair of scissors. The Observer is the only safeguard here, by construction.
+
+### The candidate set, and giving a rejection somewhere to go (session 8, phase 3)
+
+GraspGen-X generates ~416 poses per call; 16-66 survive every filter, and the runners-up sit within
+0.02-0.05 of the winner. All but one were discarded, and `_GRASP_CACHE` held **that one** keyed on
+the mask — so a re-plan after an Observer rejection re-ran the identical pipeline and got a
+bit-identical pose. Measured across every recorded multi-round iteration: **22 of 22 had identical
+scores to three decimals**, because it was literally the same object.
+
+The cache now holds the **whole surviving set** rather than the chosen pose, `grasp_detection`
+returns `candidates` (top `MAX_RETURNED_CANDIDATES` = 20, compact: index / score / position /
+approach / closing, no 4x4 per entry), and `ImagePatch.select_grasp(grasp, candidates)` rebuilds a
+full grasp from any of them.
+
+**Measured on the mustard bottle in `real_world/00`:**
+
+| | time | score | |
+|---|---|---|---|
+| first call | **10.02 s** | 0.902 | 416 -> 103 visible -> 99 on target -> 45 clear |
+| re-selection | **0.000 s** | 0.838 | a different pose, 3.2 cm away |
+| filtered by approach | 0.000 s | 0.817 | kept 3 of 20; approach_z **+0.42** against the original **+0.90** |
+
+So a rejection can now change the approach *direction*, for free. That is the actuator the loop never
+had — and the reason the Coder is a language model rather than a script, since the filter that picks
+the replacement is written on the spot for whatever the Observer objected to.
+
+Both prompts had to move with it, or the affordance stays unreachable: the Coder's API doc said
+grasp_detection returns "the best" grasp and nothing else, so writing code to pick a different one
+was not a failure of imagination but correct behaviour against the tool it had been shown. The
+Planner is now also told that re-issuing "compute the grasp pose" repeats the same computation on the
+same mask, which is how a round gets spent for nothing.
+
+**The candidates are working memory, not run history.** They are consumed from an in-memory registry
+and never read back from `progress.json`, while `RECORDER.save_grasps` already writes all ~416 to a
+`.npz` in a better form. Storing a JSON copy costs ~2.9 KB per grasp, duplicated once per inner
+round, on a file that was 51 KB. `SessionState._slim_grasp` drops them at the boundary and keeps
+`n_candidates_available` instead.
+
+### Two files, two jobs (session 8, phase 4)
+
+`progress.json` was doing both jobs badly: it stored everything and the planner
+was shown 4.1% of it, chosen by a truncation nobody had revisited. The split is
+now explicit.
+
+* **`progress.json`** — the archive. Poses, waypoints, generated code, agent
+  transcripts, timestamps. Read by `resume`, `build_report.py`,
+  `summarize_run.py` and `verify_declutter.py`. Unchanged.
+* **`planner_state.json`** — *exactly* what the task planner is told, written
+  beside it every save. `planner_context()` renders from `planner_state()`, so
+  the prompt and the file cannot drift: whatever the file says is what the
+  planner saw. Measured on a real run: **1,798 chars against 17,399**.
+
+**The plan/history join is done in Python now.** `removal_order` carried no
+status, so "attempted twice and failed" was neither done, skipped nor pending,
+and the planner re-derived its position by cross-referencing two lists on every
+call — ambiguous exactly when a run was going badly. `plan_steps()` marks each
+step `done` / `attempted` / `next` / `pending` with the iteration it happened,
+and `off_plan_actions()` flags iterations that acted on something the plan never
+named (which the geometric fallback does routinely). Both are scoped to the same
+window as the history, or a long run accumulates unbounded notes.
+
+An emptied plan no longer reads as "not set yet" — that is opposite advice
+("you have not planned" against "your plan is complete").
+
+**A rejected grasp is no longer silently replaced.** `_grasp_for` fell straight
+through to a nominal geometric grasp whenever the inner loop came back empty,
+which is right for an outage and wrong for a verdict: a run reported `success`
+carrying `score: 0.0, source: "nominal"` after the Observer had rejected every
+round on the target. The two cases are now separated, and the refusal reason
+reaches the planner instead — which is what lets it tell "this cannot be picked
+up" from "something has to be cleared first".
+
+### What the fault suite caught (session 8, phase 4)
+
+Re-running the six injected faults after removing the answer key found **three**
+defects the 833-test offline suite and `verify_declutter` both passed over —
+because neither runs the Observer.
+
+* **The clean control aborted.** Two of this session's own changes compounded:
+  phase 2 made the WRONG REGION note unconditionally decisive
+  (`semantic_alignment = no`), and phase 4 item 17 made any rejection block the
+  geometric fallback. On synthetic primitives an object *has* no parts, so
+  `find_part` correctly finds none and the Observer correctly says
+  `wrong_part` — and the loop then refused a grasp it had itself called
+  "physically feasible and collision-free". **The refusal is now phase-aware**,
+  which falls out of the phase split rather than being a special case:
+  `geometry` and `wrong_object` block in both phases; `wrong_part` blocks only
+  when delivering, because moving an object aside only needs the object to
+  move, while *how* it is held is the whole request in a handover.
+* **An ambiguous four-word phrase cost a run.** The digest said
+  `"grasp 0.47; critic: valid; 2 attempts"`, where "2 attempts" meant inner
+  rounds *within one iteration*. The planner's prompt has a two-strikes rule
+  about failed attempts *on an object*; it applied the rule correctly to the
+  wrong quantity and aborted after a single real failure, twice. Now
+  `"2 grasp attempts within this one iteration"`, with a test asserting the
+  count never appears unqualified. **No test could have caught this** — both
+  readings are valid English; only reading a run's reasoning finds it.
+* **The loop cleared objects it did not need to clear** (phase 4 addendum).
+  `blocking_objects` runs three tests at three fidelities: **occlusion** (mask
+  outline in the image, 2D), **approach** (`points_inside_sweep`, the object's
+  real 3D cloud against real gripper geometry) and **proximity** (footprint
+  centroids on the table plane, the crudest). The run's whole objective is a
+  valid grasp on the target, so flagging an object whose removal buys nothing
+  costs a grasp, a place, a re-perception and real robot motion.
+
+  Measured on `occluded_target` with one occluder left: **the banana is 78%
+  visible, the mug is flagged as blocking, and a collision-free top-down grasp
+  is already available.** The loop would have spent a full iteration to reach a
+  state it was already in.
+
+  Now: `blocking_objects(level=)` — **strict** keeps occlusion and 3D approach,
+  **relaxed** adds proximity — and the loop starts strict, escalating once only
+  when a grasp on the target actually fails. Failure to grasp is the only
+  evidence that a conservative reading was too conservative.
+  `SceneRegistry.reachable_grasp` asks the question directly.
+
+  **The gate is what a blocker blocks *by*, and getting that wrong was
+  instructive.** A first version skipped clearing whenever any grasp was
+  reachable, and immediately tried to grasp a **32%-visible fragment** — the
+  occluders are *in front of* the banana, not in the hand's way, so the nominal
+  pose is collision-free while the mask it is computed from is a scrap of the
+  object. Occlusion corrupts perception; proximity and approach are only claims
+  about reachability, which `reachable_grasp` measures better than they do. So
+  the shortcut fires only when **no** remaining blocker cites occlusion.
+  "A collision-free grasp exists" is not "the target is graspable well".
+
+  **Validated live** on the case that motivated it (`wrong_object`,
+  `occluded_target`): the hand takes the wrong object, the planner diversifies
+  to the other occluder, comes back, moves the mug **successfully** — and the
+  target is still flagged. That state aborted the run before. Now the blocker
+  list at that iteration is **empty**, because proximity is excluded at strict
+  level, and the run finishes with a **0.851** sampler grasp in 4 iterations,
+  25 LLM calls. Neither the reachability shortcut nor the escalation was needed:
+  dropping the crude test was enough.
+
+### What "in the way" means now (session 8, phase 4 second addendum)
+
+Two of the three blocking tests were **deleted rather than tuned**, because each
+answered a question it could not answer.
+
+* **approach** swept a single *synthesised top-down* pose and asked what fell
+  inside it — one direction out of the many a real grasp can come from, so a hit
+  said nothing about the grasps that matter. Across every recorded run it fired
+  **zero** times (259 occlusion flags, 5 proximity, 0 approach): it is skipped
+  while the target is occluded, and by the time the target is visible the
+  occluders have gone. It only ever ran when it had nothing to find.
+* **proximity** flagged anything within half the width of the *whole hand*
+  (10.4 cm on a Panda) on the assumption the hand must fit broadside between two
+  objects. It need not — it can come in from anywhere.
+
+**What is left are two reasons whose removal demonstrably helps:**
+
+* **occlusion** — it hides the target, so any grasp is computed from a fragment.
+  Clearing it buys information nothing else can.
+* **contact** — it is touching the target: it may resist the pick, and it may
+  topple when the target is lifted out from beside it. Neither is about
+  reaching; both are about what happens when the hand closes.
+
+**And a third that is measured rather than assumed.** When the target is visible
+the sampler proposes ~416 poses and the collision filter rejects some;
+`image_patch._attribute_collisions` records **which object's points** fouled the
+best ones, and those become blockers (`fouls_grasp`). That is the honest answer
+to "make room for the hand", from every direction the sampler tried. It also
+replaces the nominal-pose sweep in the blocker-of-a-blocker cascade.
+
+So the loop is: clear occluders and touchers → try the grasp → let the attempt
+itself name what else is in the way. No re-grasping the target after every
+removal; only when there is nothing obvious left.
+
+**Two measurement traps hit while building it.**
+
+* **Circumscribed radii are not a contact test.** Subtracting each footprint's
+  radius treats a 16 cm banana as a circle of radius 8 cm, so a cylinder
+  **3.75 cm away measured as −3.5 cm** — apparently interpenetrating. That is
+  the same over-flagging proximity was deleted for, in a new disguise.
+  `_surface_gap` measures cloud-to-cloud distance instead: the objects' points
+  are already held, it costs one KD-tree query, and it is exact for what is
+  asked. `TOUCH_MARGIN_M` is **2 cm**, absorbing the 1.0-1.7 cm single-view bias
+  (§7.3) that makes touching objects measure slightly apart.
+* **Gripper-derived placement clearance cannot be a hard requirement.** Asking
+  for `jaw_half + margin` (13.4 cm Panda, 19.6 cm Barrett) made **59 tests fail
+  with "no placement available"** on a table that had been solvable for months.
+  It is now a *preference*: ask for gripper clearance, settle for
+  `DEFAULT_MARGIN_M`. Refusing to set an object down because the *next* grasp
+  might be awkward is the wrong trade — and if the tighter spot does foul a
+  later grasp, the collision filter names it and the loop moves it again, one
+  iteration instead of a deadlock. Note the original motivation is gone anyway:
+  with proximity redefined as 2 cm contact, the plain 3 cm margin already
+  exceeds it, so nothing the system places can be re-flagged as touching.
+
+### A dropped socket used to end the run (session 8)
+
+`ChatLLM._is_retryable` matched on status codes and keywords. `openai` raises
+`APIConnectionError` whose message is the string **"Connection error."** — no
+status, no keyword — so it was classified **non-retryable**: the call failed on
+attempt 1 of 5, the provider was marked failed, and a run doing manipulation
+died on a transient blip. Over one session that aborted **four** runs and
+emptied two others' `agent_rounds`, and each one looked like a *planning*
+failure until the log was read.
+
+Now matched by **exception type first** (`openai.APIConnectionError`,
+`httpx.ConnectError` / `ReadError` / `RemoteProtocolError` / timeouts, builtin
+`ConnectionError`), with a string fallback for errors re-raised without their
+type. A genuine bug (`ValueError`, bad key) still fails fast — retrying a bad
+argument five times only delays the traceback.
+
+**The diagnosis is worth remembering**, because the obvious lead was wrong:
+13 of 17 failures hit the two agents that send **images**, which looked like a
+payload problem. It is not — the base64 overlay is **45 KB**, the vision path is
+`complete()` like everything else, and the vision model candidates are the same
+top two. The vision correlation was incidental; the defect was that *any* blip
+was fatal. Measured after the fix: 3 connection failures in one run, **0 fatal**,
+run succeeded.
+
+* **Placement clears occlusion, not proximity.** Under `wrong_object` the run
+  recovered properly — failed, diversified to the other occluder, came back and
+  *successfully* moved the mug 28 cm — and the target was still blocked, with
+  the reason changing from `occlusion` to `proximity`. `keep_out_for` protects
+  the projected sight-line (§7.5) and says nothing about the jaw gap, so an
+  object can be legitimately placed where the hand still will not fit. Predates
+  this session; exposed by the fault cascade shifting the free space. Not fixed.
+
+**Measured, six modes, `occluded_target`, `--max-round 2`:** `none`, `drop`,
+`offset`, `tip`, `collateral` all reach the target in 3-4 iterations.
+`wrong_object` recovers the object and then hits the placement gap above.
+
+**A standing hazard, seen repeatedly this session:** transient
+`All LLM providers failed for <agent>: Connection error`. It aborted a
+`collateral` run that succeeded on retry, and emptied `agent_rounds` in two
+smoke runs. The §7.11 guard handles it, but **check the log for it before
+reading any failure as a planning failure**.
+
 ### This machine
 
 * **A ROS 2 Humble workspace is sourced**, which puts `/opt/ros/humble/.../python3.10/site-packages`
@@ -803,6 +1183,171 @@ exists only when a model chooses to take it.
   `_elide` now keeps both ends.
 
 ## 8. Progress log
+
+### 2026-08-27 — session 8, phase 4: two files, and taking the answer key away
+
+Detail in §6 *"Two files, two jobs"* and *"What the fault suite caught"*.
+**837 offline tests** (21 new), **75/75** verification.
+
+* **`planner_state.json`** — exactly what the task planner is told, written
+  beside `progress.json`, which stays the archive. `planner_context()` renders
+  from it so the prompt and the file cannot drift. **1,798 chars against
+  17,399** on a real run. The plan/history join is arithmetic and is done in
+  Python now: each step marked `done` / `attempted` / `next` / `pending`, plus
+  the off-plan actions the geometric fallback takes and nothing used to mark.
+* **The executor no longer names the fault it injected.** Reports describe what
+  a sensor could observe; the cause goes to `ground_truth`, which `describe()`
+  deliberately excludes. Every previously recorded "recovery" had been reading
+  `"injected: the object slipped out of the jaw on lift"`.
+* **A rejected grasp is not silently replaced**, and the retarget gate is
+  `has_acted()` rather than two fruitless iterations.
+
+**The plan said to delete the `defer` path; that was wrong and it stays.**
+Making every refusal terminal is tidier and re-creates §7.12 exactly — a run
+that aborts at iteration 0 having done nothing. What changed is how rarely it
+fires.
+
+**Measured, six injected faults:** `none`, `drop`, `offset`, `tip`,
+`collateral` all reach the target in 3-4 iterations. `wrong_object` recovers the
+object — failing, diversifying to the other occluder, coming back and clearing
+it **without being told what the fault was**, which is the inference the whole
+change was for — and then hits the placement gap in §6.
+
+**The lesson of the phase.** The fault suite found three defects that 833
+offline tests and 75/75 verification passed over, because neither runs the
+Observer. Two were mine, introduced in phases 2 and 4. One of them was a
+four-word ambiguity in a digest — `"2 attempts"` read as iterations rather than
+rounds — that no test could catch, because both readings are correct English.
+**Read why a run did what it did; the exit status will not tell you.**
+
+### 2026-08-27 — session 8, phase 3: giving a rejection somewhere to go
+
+The phase the whole review pointed at. Detail in §6 *"The candidate set…"* and *"What VLPart can and
+cannot do"*. **816 offline tests** (29 new), **75/75** verification.
+
+**Before this, an Observer rejection could not change anything.** `grasp_detection` threw away the
+15-60 alternatives that survived its own filters and `_GRASP_CACHE` held the single winner keyed on
+the mask, so a re-plan re-ran the identical computation and got a bit-identical pose. Now the cache
+holds the whole set, the result carries `candidates`, and `select_grasp` rebuilds a full grasp from
+any of them — **0.000 s, no server call, a genuinely different approach direction**.
+
+**`find_part` no longer fails on a naming mismatch.** `bottle cap` scores 0.590 and `bottle lid`
+0.058 for the same physical feature, so one bounded retry under other names (asked of the model via
+`llm_query`, capped at two) recovers a part that is really there. The hazard and the safeguard are
+both measured, and are in §6: a bottle has no *wing*, but "shoulder" was offered and matched at
+0.302 — against 0.321 for the legitimate `lid → cap`. **No threshold separates them**, which is why
+a substitution is reported to the Observer rather than trusted.
+
+**Live**: success, 3 iterations; `(+19 alternatives)` on every grasp; `llm_query` firing for the
+synonym retry; `alts=[20]` in the stored state confirming candidates are counted rather than copied,
+with `progress.json` down from ~51 KB to ~30 KB.
+
+**Two things this session's runs surfaced that are not code defects.**
+* **Three separate provider outages** (`All LLM providers failed for … Connection error`) knocked the
+  inner loop out mid-run. The §7.11 guard caught every one, fell back to a geometric grasp and the
+  run still reached the target — which is the guard working, and also why two smoke runs could not
+  exercise a full rejection-then-reselect cycle. That path is verified by direct probe against the
+  live server and by 14 offline tests, **not yet by an Observer rejection in a live run**.
+* **All the outages were the coder, none the planner or observer.** The coder prompt is ~30 KB /
+  7.7k tokens, 2.2x the next largest, and grew 51 lines this phase. Two samples is not causation, but
+  it is the one agent whose request body is big enough for a transient drop to matter. Worth watching,
+  and worth trimming if it recurs — most of that bulk is inherited ViperGPT boilerplate.
+
+### 2026-08-27 — session 8, phase 2: what each agent is allowed to know
+
+Phase 1 fixed the instruments; phase 2 widens the channels between stages. Seven changes, detail in
+§6 *"What each agent is allowed to know"*. **787 offline tests** (32 new), **75/75** verification.
+
+**The Observer now gets what was already measured** — the selection funnel
+(`416 → 89 visible → 88 on target → 22 clear`), the three dropped-constraint warnings
+(COLLISION / OFF-TARGET / WRONG REGION), and the gripper's morphology. It is told to trust those
+numbers over the picture, because a 2D projection cannot separate a hand in front of an object from
+one driven through it, and the 3D answer was already computed.
+
+**The Planner may finally read the judgement.** Prompt rule 2 forbade it and the code enforced the
+ban. It now receives verdict, failure kind and every checklist field.
+
+**A three-way failure taxonomy**, because the three have different owners: `geometry` and
+`wrong_part` the inner loop can fix; `wrong_object` it cannot, since the id comes from the outer
+planner. It is told to return upward rather than "diversify" onto an object nobody asked for.
+
+**Measured live, `occluded_target`, clean:** success, 3 iterations, **20 LLM calls**, final grasp
+**0.886 from the sampler**. The pattern to look for in `progress.json` is a rejection carrying a
+*specific* reason followed by a pass — `wrong_part → VALID`, `geometry → VALID` — which is the loop
+acting on the diagnosis rather than re-rolling.
+
+**Two defects this cost, both introduced in phase 1 and both found only by running it.**
+
+* **Tuning the prompt against a synthetic scene, and why it was wrong twice over.** The Planner
+  chased a mug handle VLPart could not find, so the prompt was rewritten to prefer the body, then to
+  forbid `find_part` on declutter moves outright. Both edits were **reverted**, for two reasons the
+  user identified and the measurements confirmed:
+  * **The evidence was worthless.** A synthetic "mug" is a bare `cylinder` and a "banana" is a `box`
+    (`synth_scene.py`). There are no parts to find, so VLPart was *correct* every time. This is the
+    §7.13 failure — reading the detector's labels instead of the picture — repeated.
+  * **Object-specific verdicts in a prompt do not generalise.** "A mug's handle is a weaker hold"
+    trades the model's own judgement for a handful of observed cases and breaks on the unseen object
+    that is the reason for using a model at all. The branches now state a *principle* (most secure,
+    least damaging; on handover, hold what the person should not receive) with any example marked as
+    an illustration. `tests/test_prompts.py::TestGraspPurposeIsAPrinciple` fails if object-specific
+    verdicts reappear.
+  * **Part choice cannot be removed.** The Observer's `wrong_part` correction has nowhere to go if
+    `find_part` is banned, and which part to grasp is central to grasping, not a tool-only concern.
+* **A run can now report `success` on a grasp the critic rejected.** With phase 1 discarding rejected
+  grasps, `_grasp_for` falls through to the geometric fallback and returns `score: 0.0,
+  source: "nominal"`. The run before the prompt fix did exactly this. Phase 1 made it *visible*
+  rather than causing it — previously the rejected grasp was returned with a real-looking score.
+  Turning it into an honest "no grasp found, and why" is phase 4 item 17.
+
+**A process note.** One smoke run was launched without `scripts/env.sh` and silently lost the gripper
+descriptions — box-hull collision geometry, Franka-constant fingertip depth, `"unknown"` morphology —
+i.e. it re-created the exact defect phase 1 removed, announced by a single `WARNING` in a busy log.
+Source `env.sh` for **every** run, not just for tests.
+
+### 2026-08-27 — session 8, phase 1: fixing the instruments
+
+A four-agent architecture review (`/home/ishita/.claude/plans/comments-1-in-phase-enchanted-peacock.md`)
+found one mistake repeated at every layer: **each stage computes good information and discards most
+of it before the next stage sees it.** 416 grasps → 1 returned. Five Observer checklist fields → 0 the
+Planner may read. 27,673 chars of run history → 1,123 the task planner sees. 10,500 gripper surface
+points → a 7-point stick figure. Phase 1 repairs the measuring instruments, because until they are
+right nothing downstream can be trusted.
+
+**Six changes**, detail in §6 *"The picture the Observer judges from"*:
+
+1. Real `fingertip_depth` per gripper in the overlay (was a constant 0.11 m, wrong for every gripper
+   including the Franka).
+2. The mask reaches the overlay, so the magenta region the Observer prompt describes now exists.
+3. The real gripper silhouette replaces the two-finger sketch.
+4. **The two prompts disagreed about which way is up.** `find()` builds a bottom-origin axis, so a
+   larger `vertical_center` is *higher* in the picture. The Coder prompt said so; the Planner prompt
+   called it "image rows", implying the opposite. The Planner writes the plan the Coder implements, so
+   this silently grasps the object at the wrong end of the table with no error anywhere.
+   `test_prompts.py::TestVerticalConventionIsConsistent` pins the convention to `find()`'s source, not
+   to either prompt.
+5. **A rejected grasp is no longer kept.** The loop did `grasp_pose = result["grasp"]` every round with
+   no reference to the verdict, so a query that ran out of rounds finished holding the last *rejected*
+   pose and handed it to the executor. Now `GraspMAS._keeps_grasp`: keep the **latest** grasp the
+   Observer did not reject — latest, not best-scoring, because a rejected grasp was rejected for a
+   reason and the next round exists to fix it, while the score is the discriminator's opinion of the
+   pose in isolation and knows nothing about the scene or the query. An *unparseable* verdict still
+   keeps the grasp: a provider hiccup on the critique is no evidence against the pose.
+6. **The inner loop could not tell "move this aside" from "hand this over".** Both paths sent it the
+   same bare instance id. On a knife those want opposite grips — shifted off the table it goes by the
+   handle, handed to a person it goes by the blade so they receive the handle — and the system held
+   three different opinions about this at once (Coder example: blade; Observer rule: blade is fragile,
+   auto-reject; live Planner: handle). `_grasp_for(..., phase=)` now carries "declutter" or "deliver"
+   plus the person's own words, and all three prompts were made to agree.
+
+**Measured.** 730 offline tests before, **755 after** (25 new, 0 failures). `verify_declutter.py`
+**75/75**. One live run, `occluded_target`, clean: **success in 3 iterations, 18 LLM calls** — inside
+the 16-20 baseline, so nothing regressed. The new rule fired in that run and is visible in `log.txt`:
+`round 0: grasp rejected by the Observer, not kept`, then round 1 produced a grasp that was accepted.
+
+**Confirmed live but not yet fixed** — the same run logged `execute_command returned dict in 0.0s` on
+the round *after* a rejection. That is `_GRASP_CACHE` returning the identical pose, which is Phase 3's
+subject: a rejection currently has no way to produce a different grasp.
+
 
 ### 2026-08-24 — session 7: many keys, and an offset that does not clear the target
 
